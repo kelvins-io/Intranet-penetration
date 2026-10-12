@@ -1,0 +1,6 @@
+listen: ":7700"
+http_gateway: ":8088"
+token: "dev-token-change-me"
+public_host: "127.0.0.1"
+tcp_port_min: 20000
+tcp_port_max: 30000

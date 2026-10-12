@@ -1,0 +1,12 @@
+server_addr: "127.0.0.1:7700"
+token: "dev-token-change-me"
+agent_id: "dev-agent"
+reconnect: 3s
+tunnels:
+  - name: demo
+    type: http
+    local_addr: "127.0.0.1:9000"
+  - name: echo-tcp
+    type: tcp
+    local_addr: "127.0.0.1:9001"
+    # remote_port: 20001  # optional; server assigns if omitted
