@@ -1,0 +1,41 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - redis
+    ports:
+      - "7700:7700/tcp"
+      - "7700:7700/udp"
+      - "8088:8088"
+      - "8443:8443"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/server:/app/data
+      - ./configs/server.yaml:/app/configs/server.yaml:ro
+    command: ["-config", "/app/configs/server.yaml"]
+
+  # Optional demo agent: docker compose --profile with-agent up -d
+  agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - server
+    network_mode: host
+    entrypoint: ["/app/agent"]
+    volumes:
+      - ./data/agent:/app/data
+      - ./configs/agent.yaml:/app/configs/agent.yaml:ro
+    command: ["-config", "/app/configs/agent.yaml"]
+    profiles: ["with-agent"]

@@ -9,8 +9,14 @@ import (
 )
 
 type PeerConfig struct {
-	ID   string `yaml:"id"`
-	HTTP string `yaml:"http"`
+	ID     string `yaml:"id"`
+	HTTP   string `yaml:"http"`
+	Region string `yaml:"region"`
+}
+
+type RegionPeer struct {
+	Name          string `yaml:"name"`
+	AdvertiseHTTP string `yaml:"advertise_http"`
 }
 
 type ClusterConfig struct {
@@ -21,18 +27,17 @@ type ClusterConfig struct {
 }
 
 type OIDCConfig struct {
-	Enabled      bool   `yaml:"enabled"`
-	Issuer       string `yaml:"issuer"`
-	ClientID     string `yaml:"client_id"`
-	ClientSecret string `yaml:"client_secret"`
-	RedirectURL  string `yaml:"redirect_url"`
-	// Optional: restrict to these email domains (empty = allow all)
+	Enabled        bool     `yaml:"enabled"`
+	Issuer         string   `yaml:"issuer"`
+	ClientID       string   `yaml:"client_id"`
+	ClientSecret   string   `yaml:"client_secret"`
+	RedirectURL    string   `yaml:"redirect_url"`
 	AllowedDomains []string `yaml:"allowed_domains"`
 }
 
 type ServerConfig struct {
 	Listen        string        `yaml:"listen"`
-	QUICListen    string        `yaml:"quic_listen"` // UDP; empty disables QUIC
+	QUICListen    string        `yaml:"quic_listen"`
 	HTTPGateway   string        `yaml:"http_gateway"`
 	HTTPSGateway  string        `yaml:"https_gateway"`
 	Token         string        `yaml:"token"`
@@ -48,7 +53,10 @@ type ServerConfig struct {
 	TLSKey        string        `yaml:"tls_key"`
 	AutoTLS       bool          `yaml:"auto_tls"`
 	EdgeID        string        `yaml:"edge_id"`
+	Region        string        `yaml:"region"`
+	EnableE2E     bool          `yaml:"enable_e2e"` // backhaul AEAD Edge↔Agent
 	ResumeTTL     time.Duration `yaml:"resume_ttl"`
+	Regions       []RegionPeer  `yaml:"regions"` // multi-region directory
 	Cluster       ClusterConfig `yaml:"cluster"`
 	OIDC          OIDCConfig    `yaml:"oidc"`
 	ReadTimeout   time.Duration `yaml:"read_timeout"`
@@ -64,15 +72,16 @@ type AgentTunnel struct {
 }
 
 type AgentConfig struct {
-	ServerAddr string        `yaml:"server_addr"`
-	QUICAddr   string        `yaml:"quic_addr"` // defaults to server_addr
-	PreferQUIC bool          `yaml:"prefer_quic"`
-	Token      string        `yaml:"token"`
-	AgentID    string        `yaml:"agent_id"`
-	Tunnels    []AgentTunnel `yaml:"tunnels"`
-	Reconnect  time.Duration `yaml:"reconnect"`
-	// ResumeTokenFile persists resume token across agent restarts.
-	ResumeTokenFile string `yaml:"resume_token_file"`
+	ServerAddr      string        `yaml:"server_addr"`
+	QUICAddr        string        `yaml:"quic_addr"`
+	PreferQUIC      bool          `yaml:"prefer_quic"`
+	PreferE2E       bool          `yaml:"prefer_e2e"`
+	Region          string        `yaml:"region"`
+	Token           string        `yaml:"token"`
+	AgentID         string        `yaml:"agent_id"`
+	Tunnels         []AgentTunnel `yaml:"tunnels"`
+	Reconnect       time.Duration `yaml:"reconnect"`
+	ResumeTokenFile string        `yaml:"resume_token_file"`
 }
 
 func LoadServer(path string) (*ServerConfig, error) {
@@ -90,6 +99,8 @@ func LoadServer(path string) (*ServerConfig, error) {
 		AdminPassword: "admin123",
 		AutoTLS:       true,
 		EdgeID:        "edge-1",
+		Region:        "local",
+		EnableE2E:     true,
 		ResumeTTL:     5 * time.Minute,
 		ReadTimeout:   30 * time.Second,
 		WriteTimeout:  30 * time.Second,
@@ -108,6 +119,9 @@ func LoadServer(path string) (*ServerConfig, error) {
 	}
 	if cfg.EdgeID == "" {
 		cfg.EdgeID = "edge-1"
+	}
+	if cfg.Region == "" {
+		cfg.Region = "local"
 	}
 	if cfg.Cluster.AdvertiseHTTP == "" {
 		cfg.Cluster.AdvertiseHTTP = "http://127.0.0.1" + normalizeListen(cfg.HTTPGateway)
@@ -132,6 +146,8 @@ func LoadAgent(path string) (*AgentConfig, error) {
 	cfg := &AgentConfig{
 		ServerAddr:      "127.0.0.1:7700",
 		PreferQUIC:      true,
+		PreferE2E:       true,
+		Region:          "local",
 		Reconnect:       3 * time.Second,
 		ResumeTokenFile: "data/agent_resume.token",
 	}

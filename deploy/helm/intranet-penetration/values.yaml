@@ -1,0 +1,36 @@
+replicaCount: 2
+
+image:
+  repository: intranet-penetration
+  tag: "0.3.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: LoadBalancer
+  tcpPort: 7700
+  udpPort: 7700
+  httpPort: 8088
+  httpsPort: 8443
+
+config:
+  edgeId: edge-1
+  region: cn-east
+  enableE2E: true
+  token: "change-me"
+  adminEmail: "admin@localhost"
+  adminPassword: "admin123"
+  baseDomain: "tunnel.example.com"
+  clusterSecret: "change-me-cluster"
+  redisURL: "redis://redis:6379/0"
+
+redis:
+  enabled: true
+  architecture: standalone
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi

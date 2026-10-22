@@ -8,20 +8,25 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	"github.com/kelvins-io/Intranet-penetration/internal/e2e"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
 	"github.com/quic-go/quic-go"
 )
 
 // Session wraps either a yamux (TCP) or QUIC multiplexed connection.
 type Session struct {
-	conn     net.Conn
-	mux      *yamux.Session
-	quicConn *quic.Conn
-	control  net.Conn
-	closed   chan struct{}
-	mu       sync.Mutex
+	conn      net.Conn
+	mux       *yamux.Session
+	quicConn  *quic.Conn
+	control   net.Conn
+	closed    chan struct{}
+	mu        sync.Mutex
 	transport string // "tcp" | "quic"
+	e2e       bool
 }
+
+func (s *Session) SetE2E(v bool) { s.e2e = v }
+func (s *Session) E2E() bool     { return s.e2e }
 
 func ServerSession(conn net.Conn) (*Session, error) {
 	cfg := yamux.DefaultConfig()
@@ -182,6 +187,7 @@ func (s *Session) HandshakeAsClient(hello protocol.Hello) (*protocol.HelloAck, e
 }
 
 // OpenDataStream opens a multiplexed stream and writes an OpenRequest header.
+// When session E2E is enabled, performs ECDH after OpenAck and returns a sealed conn.
 func (s *Session) OpenDataStream(tunnel, meta string) (net.Conn, error) {
 	stream, err := s.OpenStream()
 	if err != nil {
@@ -190,6 +196,7 @@ func (s *Session) OpenDataStream(tunnel, meta string) (net.Conn, error) {
 	if err := protocol.WriteJSON(stream, protocol.MsgOpen, protocol.OpenRequest{
 		Tunnel: tunnel,
 		Meta:   meta,
+		E2E:    s.e2e,
 	}); err != nil {
 		_ = stream.Close()
 		return nil, err
@@ -211,6 +218,14 @@ func (s *Session) OpenDataStream(tunnel, meta string) (net.Conn, error) {
 	if !ack.OK {
 		_ = stream.Close()
 		return nil, fmt.Errorf("open rejected: %s", ack.Error)
+	}
+	if s.e2e && ack.E2E {
+		sealed, err := e2e.HandshakeAsClient(stream)
+		if err != nil {
+			_ = stream.Close()
+			return nil, fmt.Errorf("e2e handshake: %w", err)
+		}
+		return sealed, nil
 	}
 	return stream, nil
 }
@@ -240,6 +255,19 @@ func (s *Session) AcceptDataStream() (net.Conn, protocol.OpenRequest, error) {
 
 func AckOpen(stream net.Conn, ok bool, errMsg string) error {
 	return protocol.WriteJSON(stream, protocol.MsgOpenAck, protocol.OpenAck{OK: ok, Error: errMsg})
+}
+
+// AckOpenE2E acknowledges open and optionally enables E2E on the ack.
+func AckOpenE2E(stream net.Conn, ok bool, errMsg string, useE2E bool) error {
+	return protocol.WriteJSON(stream, protocol.MsgOpenAck, protocol.OpenAck{OK: ok, Error: errMsg, E2E: useE2E && ok})
+}
+
+// MaybeSealServer completes E2E handshake as responder when requested.
+func MaybeSealServer(stream net.Conn, req protocol.OpenRequest, sessionE2E bool) (net.Conn, error) {
+	if !(sessionE2E && req.E2E) {
+		return stream, nil
+	}
+	return e2e.HandshakeAsServer(stream)
 }
 
 // Proxy bidirectional copy until either side closes.

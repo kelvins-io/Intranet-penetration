@@ -1,4 +1,4 @@
-.PHONY: build run-server run-agent run-demo test tidy
+.PHONY: build run-server run-agent run-demo test tidy private-up private-down
 
 build:
 	go build -o bin/server ./cmd/server
@@ -19,3 +19,9 @@ run-agent:
 
 run-demo:
 	go run ./examples/local-http
+
+private-up:
+	./scripts/private-install.sh
+
+private-down:
+	docker compose -f deploy/docker-compose.yml --profile with-agent down

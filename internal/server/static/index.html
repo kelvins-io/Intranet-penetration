@@ -133,11 +133,18 @@
         </table>
       </section>
       <section class="card">
-        <h2>集群 Edges</h2>
+        <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2>集群 / 区域 / SLA</h2>
+          <div class="row">
+            <button class="secondary" id="btnSLA">SLA 报告</button>
+            <button class="secondary" id="btnExport">合规导出</button>
+          </div>
+        </div>
         <table>
-          <thead><tr><th>Edge</th><th>Advertise</th><th>Last Seen</th></tr></thead>
+          <thead><tr><th>Edge</th><th>Region</th><th>Advertise</th><th>Last Seen</th></tr></thead>
           <tbody id="edges"></tbody>
         </table>
+        <p class="muted" id="slaHint" style="margin-top:12px"></p>
       </section>
       <section class="card">
         <h2>审计日志</h2>
@@ -207,9 +214,9 @@
       const stats = await api('/api/v1/stats');
       document.getElementById('stats').innerHTML = [
         ['在线 Agent', stats.online_agents],
-        ['隧道数', stats.tunnels],
-        ['Edge', stats.edge_id || '-'],
-        ['配额 Tunnels', stats.quota.max_tunnels],
+        ['Region', stats.region || '-'],
+        ['E2E', stats.e2e_enabled ? 'on' : 'off'],
+        ['可用性%', (stats.sla && stats.sla.availability_pct != null) ? stats.sla.availability_pct.toFixed(2) : '-'],
       ].map(([l, v]) => `<div class="card"><div class="label">${l}</div><div class="value">${v}</div></div>`).join('');
 
       try {
@@ -217,11 +224,16 @@
         document.getElementById('edges').innerHTML = (cluster.edges || []).map(e => `
           <tr>
             <td><code>${e.id}</code></td>
+            <td>${e.region || '-'}</td>
             <td class="muted">${e.advertise_http || '-'}</td>
             <td class="muted">${e.last_seen ? new Date(e.last_seen).toLocaleString() : '-'}</td>
-          </tr>`).join('') || `<tr><td colspan="3" class="muted">当前 ${cluster.edge_id}</td></tr>`;
+          </tr>`).join('') || `<tr><td colspan="4" class="muted">当前 ${cluster.edge_id} / ${cluster.region || '-'}</td></tr>`;
+        if (stats.sla) {
+          document.getElementById('slaHint').textContent =
+            `HTTP ${stats.sla.http_requests} · TCP ${stats.sla.tcp_connections} · E2E streams ${stats.sla.e2e_streams} · uptime ${stats.sla.uptime_seconds}s`;
+        }
       } catch (_) {
-        document.getElementById('edges').innerHTML = '<tr><td colspan="3" class="muted">-</td></tr>';
+        document.getElementById('edges').innerHTML = '<tr><td colspan="4" class="muted">-</td></tr>';
       }
 
       const tunnels = await api('/api/v1/tunnels');
@@ -280,6 +292,20 @@
       await refresh();
     };
 
+    document.getElementById('btnSLA').onclick = async () => {
+      const r = await api('/api/v1/sla/report');
+      alert(JSON.stringify(r.report, null, 2));
+    };
+    document.getElementById('btnExport').onclick = async () => {
+      const res = await fetch('/api/v1/compliance/export', {
+        headers: { Authorization: 'Bearer ' + state.key },
+      });
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'compliance-export.json';
+      a.click();
+    };
     document.getElementById('btnOIDC').onclick = () => {
       location.href = '/api/v1/auth/oidc/login';
     };

@@ -1,0 +1,32 @@
+listen: ":7700"
+quic_listen: ":7700"
+http_gateway: ":8088"
+https_gateway: ":8443"
+token: "dev-token-change-me"
+public_host: "127.0.0.1"
+base_domain: "tunnel.local"
+data_dir: "data"
+edge_id: "edge-1"
+region: "cn-east"
+enable_e2e: true
+resume_ttl: 5m
+admin_email: "admin@localhost"
+admin_password: "admin123"
+auto_tls: true
+tcp_port_min: 20000
+tcp_port_max: 30000
+
+regions:
+  - name: cn-east
+    advertise_http: "http://127.0.0.1:8088"
+  # - name: cn-north
+  #   advertise_http: "http://edge-north.example.com:8088"
+
+cluster:
+  redis_url: "redis://redis:6379/0"
+  secret: "cluster-dev-secret"
+  advertise_http: "http://server:8088"
+  peers: []
+
+oidc:
+  enabled: false

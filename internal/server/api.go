@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kelvins-io/Intranet-penetration/internal/store"
 )
@@ -30,6 +31,9 @@ func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/audit", s.withAuth(s.handleAudit))
 	mux.HandleFunc("/api/v1/stats", s.withAuth(s.handleStats))
 	mux.HandleFunc("/api/v1/cluster", s.withAuth(s.handleCluster))
+	mux.HandleFunc("/api/v1/regions", s.withAuth(s.handleRegions))
+	mux.HandleFunc("/api/v1/sla/report", s.withAuth(s.handleSLAReport))
+	mux.HandleFunc("/api/v1/compliance/export", s.withAuth(s.handleComplianceExport))
 	// backward compatible
 	mux.HandleFunc("/api/tunnels", s.handleLegacyTunnels)
 }
@@ -222,6 +226,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, au *apiUser
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, au *apiUser) {
 	total, tcp := s.store.CountTunnels(au.Tenant.ID)
+	snap := s.metrics.Snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"tenant":        au.Tenant,
 		"online_agents": s.store.CountOnlineAgents(au.Tenant.ID),
@@ -230,18 +235,92 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, au *apiUser
 		"live_routes":   len(s.registry.List()),
 		"quota":         au.Tenant.Quota,
 		"edge_id":       s.cfg.EdgeID,
+		"region":        s.cfg.Region,
+		"e2e_enabled":   s.cfg.EnableE2E,
 		"oidc_enabled":  s.oidc != nil,
+		"sla":           snap,
 	})
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request, au *apiUser) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"edge_id":        s.cfg.EdgeID,
+		"region":         s.cfg.Region,
 		"advertise_http": s.cfg.Cluster.AdvertiseHTTP,
 		"edges":          s.cluster.ListEdges(),
 		"tunnels":        s.cluster.ListTunnels(),
 		"redis":          s.cfg.Cluster.RedisURL != "",
 	})
+}
+
+func (s *Server) handleRegions(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	type regionView struct {
+		Name          string `json:"name"`
+		AdvertiseHTTP string `json:"advertise_http,omitempty"`
+		Local         bool   `json:"local,omitempty"`
+		Edges         int    `json:"edges"`
+	}
+	byName := map[string]*regionView{}
+	byName[s.cfg.Region] = &regionView{Name: s.cfg.Region, AdvertiseHTTP: s.cfg.Cluster.AdvertiseHTTP, Local: true, Edges: 1}
+	for _, rp := range s.cfg.Regions {
+		if _, ok := byName[rp.Name]; !ok {
+			byName[rp.Name] = &regionView{Name: rp.Name, AdvertiseHTTP: rp.AdvertiseHTTP}
+		}
+	}
+	for _, e := range s.cluster.ListEdges() {
+		name := e.Region
+		if name == "" {
+			name = "unknown"
+		}
+		if _, ok := byName[name]; !ok {
+			byName[name] = &regionView{Name: name, AdvertiseHTTP: e.AdvertiseHTTP}
+		}
+		if name != s.cfg.Region {
+			byName[name].Edges++
+		}
+	}
+	out := make([]regionView, 0, len(byName))
+	for _, v := range byName {
+		out = append(out, *v)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleSLAReport(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	snap := s.metrics.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tenant_id":   au.Tenant.ID,
+		"tenant_slug": au.Tenant.Slug,
+		"edge_id":     s.cfg.EdgeID,
+		"region":      s.cfg.Region,
+		"generated":   snap.StartedAt,
+		"report":      snap,
+		"target_sla":  "99.95%",
+		"note":        "Availability derived from process uptime; wire synthetic probes for production SLA.",
+	})
+}
+
+func (s *Server) handleComplianceExport(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	tenantID := au.Tenant.ID
+	if au.User.Role == store.RoleAdmin && r.URL.Query().Get("all") == "1" {
+		tenantID = ""
+	}
+	payload := map[string]any{
+		"exported_at": time.Now().UTC(),
+		"actor":       au.User.Email,
+		"tenant_id":   au.Tenant.ID,
+		"tunnels":     s.store.ListTunnels(tenantID),
+		"audits":      s.store.ListAudits(tenantID, 1000),
+		"users":       s.store.ListUsers(tenantID),
+		"tokens":      s.store.ListAgentTokens(tenantID),
+		"sla":         s.metrics.Snapshot(),
+		"region":      s.cfg.Region,
+		"edge_id":     s.cfg.EdgeID,
+		"e2e":         s.cfg.EnableE2E,
+	}
+	s.store.Audit(au.Tenant.ID, au.User.Email, "compliance.export", au.Tenant.ID, "json")
+	w.Header().Set("Content-Disposition", "attachment; filename=compliance-export.json")
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleOIDCStatus(w http.ResponseWriter, r *http.Request) {

@@ -116,9 +116,9 @@ func (r *RedisRegistry) DeleteAgent(tenantID, agentID string) error {
 	return nil
 }
 
-func (r *RedisRegistry) Heartbeat(edgeID, advertiseHTTP string) error {
+func (r *RedisRegistry) Heartbeat(edgeID, advertiseHTTP, region string) error {
 	ctx := context.Background()
-	info := EdgeInfo{ID: edgeID, AdvertiseHTTP: advertiseHTTP, LastSeen: time.Now().UTC()}
+	info := EdgeInfo{ID: edgeID, AdvertiseHTTP: advertiseHTTP, Region: region, LastSeen: time.Now().UTC()}
 	b, _ := json.Marshal(info)
 	return r.rdb.Set(ctx, redisEdgePrefix+edgeID, b, redisTTL).Err()
 }

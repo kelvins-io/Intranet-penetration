@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: intranet-penetration
+  ports:
+    - name: agent-tcp
+      port: {{ .Values.service.tcpPort }}
+      targetPort: agent-tcp
+      protocol: TCP
+    - name: agent-udp
+      port: {{ .Values.service.udpPort }}
+      targetPort: agent-udp
+      protocol: UDP
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+    - name: https
+      port: {{ .Values.service.httpsPort }}
+      targetPort: https

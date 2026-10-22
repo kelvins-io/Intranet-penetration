@@ -1,6 +1,8 @@
 server_addr: "127.0.0.1:7700"
 quic_addr: "127.0.0.1:7700"
 prefer_quic: true
+prefer_e2e: true
+region: "local"
 token: "dev-token-change-me"
 agent_id: "dev-agent"
 reconnect: 3s

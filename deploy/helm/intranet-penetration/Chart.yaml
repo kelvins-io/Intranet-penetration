@@ -1,0 +1,6 @@
+apiVersion: v2
+name: intranet-penetration
+description: Industrial intranet tunnel platform (private deployment)
+type: application
+version: 0.3.0
+appVersion: "0.3.0"

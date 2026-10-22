@@ -62,6 +62,8 @@ func (a *Agent) connectOnce(ctx context.Context) error {
 		Token:       a.cfg.Token,
 		AgentID:     a.cfg.AgentID,
 		ResumeToken: a.resumeToken,
+		PreferE2E:   a.cfg.PreferE2E,
+		Region:      a.cfg.Region,
 	}
 	for _, t := range a.cfg.Tunnels {
 		hello.Tunnels = append(hello.Tunnels, protocol.TunnelSpec{
@@ -77,10 +79,12 @@ func (a *Agent) connectOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	sess.SetE2E(ack.E2E)
 	if ack.ResumeToken != "" {
 		a.resumeToken = ack.ResumeToken
 		_ = a.saveResumeToken(ack.ResumeToken)
 	}
+	a.log.Info("session ready", "e2e", ack.E2E, "region", ack.Region, "edge", ack.EdgeID)
 	for _, t := range ack.Tunnels {
 		a.log.Info("tunnel assigned",
 			"name", t.Name,
@@ -157,12 +161,23 @@ func (a *Agent) handleStream(ctx context.Context, stream net.Conn, req protocol.
 		a.log.Warn("dial local failed", "tunnel", req.Tunnel, "local", localAddr, "err", err)
 		return
 	}
-	if err := tunnel.AckOpen(stream, true, ""); err != nil {
+	useE2E := req.E2E && a.cfg.PreferE2E
+	if err := tunnel.AckOpenE2E(stream, true, "", useE2E); err != nil {
 		_ = upstream.Close()
 		_ = stream.Close()
 		return
 	}
-	a.log.Info("stream opened", "tunnel", req.Tunnel, "meta", req.Meta, "local", localAddr)
+	if useE2E {
+		sealed, err := tunnel.MaybeSealServer(stream, req, true)
+		if err != nil {
+			_ = upstream.Close()
+			_ = stream.Close()
+			a.log.Warn("e2e handshake failed", "err", err)
+			return
+		}
+		stream = sealed
+	}
+	a.log.Info("stream opened", "tunnel", req.Tunnel, "meta", req.Meta, "local", localAddr, "e2e", useE2E)
 	tunnel.Proxy(stream, upstream)
 }
 

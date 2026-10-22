@@ -57,6 +57,10 @@ func (s *Server) handleTCPConn(tenantID, tunnelName string, client net.Conn) {
 		s.log.Warn("open agent stream", "tunnel", tunnelName, "err", err)
 		return
 	}
+	s.metrics.IncTCP()
+	if route, ok := s.registry.Get(tenantID, tunnelName); ok && route.Session != nil && route.Session.E2E() {
+		s.metrics.IncE2E()
+	}
 	s.store.Audit(tenantID, "public", "tcp.access", tunnelName, client.RemoteAddr().String())
 	tunnel.Proxy(client, stream)
 }

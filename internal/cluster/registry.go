@@ -7,22 +7,24 @@ import (
 )
 
 type TunnelLocation struct {
-	EdgeID       string    `json:"edge_id"`
-	AdvertiseHTTP string   `json:"advertise_http"`
-	TenantID     string    `json:"tenant_id"`
-	TenantSlug   string    `json:"tenant_slug"`
-	TunnelName   string    `json:"tunnel_name"`
-	AgentID      string    `json:"agent_id"`
-	Type         string    `json:"type"`
-	Domain       string    `json:"domain,omitempty"`
-	PublicAddr   string    `json:"public_addr,omitempty"`
-	RemotePort   int       `json:"remote_port,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	EdgeID        string    `json:"edge_id"`
+	AdvertiseHTTP string    `json:"advertise_http"`
+	Region        string    `json:"region,omitempty"`
+	TenantID      string    `json:"tenant_id"`
+	TenantSlug    string    `json:"tenant_slug"`
+	TunnelName    string    `json:"tunnel_name"`
+	AgentID       string    `json:"agent_id"`
+	Type          string    `json:"type"`
+	Domain        string    `json:"domain,omitempty"`
+	PublicAddr    string    `json:"public_addr,omitempty"`
+	RemotePort    int       `json:"remote_port,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type EdgeInfo struct {
 	ID            string    `json:"id"`
 	AdvertiseHTTP string    `json:"advertise_http"`
+	Region        string    `json:"region,omitempty"`
 	LastSeen      time.Time `json:"last_seen"`
 }
 
@@ -32,7 +34,7 @@ type Registry interface {
 	Get(tenantID, name string) (*TunnelLocation, bool)
 	GetByDomain(domain string) (*TunnelLocation, bool)
 	DeleteAgent(tenantID, agentID string) error
-	Heartbeat(edgeID, advertiseHTTP string) error
+	Heartbeat(edgeID, advertiseHTTP, region string) error
 	ListEdges() []EdgeInfo
 	ListTunnels() []TunnelLocation
 	Close() error
@@ -110,10 +112,12 @@ func (m *MemoryRegistry) DeleteAgent(tenantID, agentID string) error {
 	return nil
 }
 
-func (m *MemoryRegistry) Heartbeat(edgeID, advertiseHTTP string) error {
+func (m *MemoryRegistry) Heartbeat(edgeID, advertiseHTTP, region string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.edges[edgeID] = EdgeInfo{ID: edgeID, AdvertiseHTTP: advertiseHTTP, LastSeen: time.Now().UTC()}
+	m.edges[edgeID] = EdgeInfo{
+		ID: edgeID, AdvertiseHTTP: advertiseHTTP, Region: region, LastSeen: time.Now().UTC(),
+	}
 	return nil
 }
 

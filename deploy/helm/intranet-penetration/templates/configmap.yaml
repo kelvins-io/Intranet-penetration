@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+data:
+  server.yaml: |
+    listen: ":7700"
+    quic_listen: ":7700"
+    http_gateway: ":8088"
+    https_gateway: ":8443"
+    token: {{ .Values.config.token | quote }}
+    public_host: "0.0.0.0"
+    base_domain: {{ .Values.config.baseDomain | quote }}
+    data_dir: "data"
+    edge_id: {{ .Values.config.edgeId | quote }}
+    region: {{ .Values.config.region | quote }}
+    enable_e2e: {{ .Values.config.enableE2E }}
+    resume_ttl: 5m
+    admin_email: {{ .Values.config.adminEmail | quote }}
+    admin_password: {{ .Values.config.adminPassword | quote }}
+    auto_tls: true
+    tcp_port_min: 20000
+    tcp_port_max: 30000
+    cluster:
+      redis_url: {{ .Values.config.redisURL | quote }}
+      secret: {{ .Values.config.clusterSecret | quote }}
+      advertise_http: "http://{{ .Release.Name }}:{{ .Values.service.httpPort }}"
+    oidc:
+      enabled: false

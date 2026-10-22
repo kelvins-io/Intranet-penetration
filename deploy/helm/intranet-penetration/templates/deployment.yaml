@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-server
+  labels:
+    app: intranet-penetration
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: intranet-penetration
+  template:
+    metadata:
+      labels:
+        app: intranet-penetration
+    spec:
+      containers:
+        - name: server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-config", "/config/server.yaml"]
+          ports:
+            - name: agent-tcp
+              containerPort: 7700
+              protocol: TCP
+            - name: agent-udp
+              containerPort: 7700
+              protocol: UDP
+            - name: http
+              containerPort: 8088
+            - name: https
+              containerPort: 8443
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: data
+              mountPath: /app/data
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+        - name: data
+          emptyDir: {}

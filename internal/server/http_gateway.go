@@ -73,6 +73,10 @@ func (s *Server) proxyLocalHTTP(w http.ResponseWriter, r *http.Request, tenantID
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	s.metrics.IncHTTP()
+	if route, ok := s.registry.Get(tenantID, name); ok && route.Session != nil && route.Session.E2E() {
+		s.metrics.IncE2E()
+	}
 
 	s.store.Audit(tenantID, "public", "http.access", name, r.Method+" "+r.URL.Path+" from "+r.RemoteAddr)
 

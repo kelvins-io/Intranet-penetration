@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version = 2
+	Version = 3
 
 	MaxFrameSize = 1 << 20 // 1 MiB
 )
@@ -48,6 +48,8 @@ type Hello struct {
 	Token       string       `json:"token"`
 	AgentID     string       `json:"agent_id"`
 	ResumeToken string       `json:"resume_token,omitempty"`
+	PreferE2E   bool         `json:"prefer_e2e,omitempty"`
+	Region      string       `json:"region,omitempty"`
 	Tunnels     []TunnelSpec `json:"tunnels"`
 }
 
@@ -67,6 +69,8 @@ type HelloAck struct {
 	Resumed     bool             `json:"resumed,omitempty"`
 	Transport   string           `json:"transport,omitempty"` // quic | tcp
 	EdgeID      string           `json:"edge_id,omitempty"`
+	Region      string           `json:"region,omitempty"`
+	E2E         bool             `json:"e2e,omitempty"` // backhaul AEAD enabled
 	Tunnels     []AssignedTunnel `json:"tunnels"`
 	Message     string           `json:"message,omitempty"`
 }
@@ -75,11 +79,13 @@ type HelloAck struct {
 type OpenRequest struct {
 	Tunnel string `json:"tunnel"`
 	Meta   string `json:"meta,omitempty"` // e.g. remote client addr
+	E2E    bool   `json:"e2e,omitempty"`
 }
 
 type OpenAck struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+	E2E   bool   `json:"e2e,omitempty"`
 }
 
 type Envelope struct {

@@ -14,6 +14,7 @@ import (
 	"github.com/kelvins-io/Intranet-penetration/internal/authoidc"
 	"github.com/kelvins-io/Intranet-penetration/internal/cluster"
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
+	"github.com/kelvins-io/Intranet-penetration/internal/metrics"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
 	"github.com/kelvins-io/Intranet-penetration/internal/resume"
 	"github.com/kelvins-io/Intranet-penetration/internal/store"
@@ -30,6 +31,7 @@ type Server struct {
 	resume   *resume.Store
 	oidc     *authoidc.Provider
 	tlsConf  *tls.Config
+	metrics  *metrics.Collector
 	log      *slog.Logger
 
 	mu        sync.Mutex
@@ -92,6 +94,7 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 		resume:   resume.New(cfg.ResumeTTL),
 		oidc:     oidcProv,
 		tlsConf:  tlsConf,
+		metrics:  metrics.New(),
 		log:      log,
 		tcpStops: make(map[string]context.CancelFunc),
 	}, nil
@@ -144,11 +147,13 @@ func (s *Server) Run(ctx context.Context) error {
 		go s.serveHTTPGateway(ctx, ln)
 	}
 
-	_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP)
+	_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP, s.cfg.Region)
 	go s.heartbeatLoop(ctx)
 
 	s.log.Info("control plane ready",
 		"edge_id", s.cfg.EdgeID,
+		"region", s.cfg.Region,
+		"e2e", s.cfg.EnableE2E,
 		"dashboard", fmt.Sprintf("http://%s/dashboard/", s.httpAdvertiseHost()),
 		"oidc", s.oidc != nil,
 		"admin_api_key_hint", maskKey(s.store.AdminAPIKey()),
@@ -225,20 +230,26 @@ func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, re
 		tenant = t
 		a.Transport = sess.Transport()
 		a.EdgeID = s.cfg.EdgeID
+		a.Region = s.cfg.Region
+		a.E2E = s.cfg.EnableE2E && h.PreferE2E
 		return a, nil
 	})
 	if err != nil {
 		s.log.Warn("handshake failed", "remote", remote, "err", err)
 		return
 	}
+	sess.SetE2E(ack.E2E)
+	s.metrics.IncAgent()
 	s.log.Info("agent registered",
 		"agent_id", ack.AgentID,
 		"tenant", tenant.Slug,
 		"tunnels", len(ack.Tunnels),
 		"resumed", ack.Resumed,
 		"transport", ack.Transport,
+		"e2e", ack.E2E,
+		"region", ack.Region,
 	)
-	s.store.Audit(tenant.ID, ack.AgentID, "agent.connect", ack.AgentID, remote+" "+ack.Transport)
+	s.store.Audit(tenant.ID, ack.AgentID, "agent.connect", ack.AgentID, remote+" "+ack.Transport+" e2e="+fmt.Sprint(ack.E2E))
 
 	for _, assigned := range ack.Tunnels {
 		route := &Route{
@@ -276,6 +287,7 @@ func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, re
 		_ = s.cluster.Put(cluster.TunnelLocation{
 			EdgeID:        s.cfg.EdgeID,
 			AdvertiseHTTP: s.cfg.Cluster.AdvertiseHTTP,
+			Region:        s.cfg.Region,
 			TenantID:      tenant.ID,
 			TenantSlug:    tenant.Slug,
 			TunnelName:    assigned.Name,
@@ -526,11 +538,12 @@ func (s *Server) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP)
+			_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP, s.cfg.Region)
 			for _, route := range s.registry.List() {
 				_ = s.cluster.Put(cluster.TunnelLocation{
 					EdgeID:        s.cfg.EdgeID,
 					AdvertiseHTTP: s.cfg.Cluster.AdvertiseHTTP,
+					Region:        s.cfg.Region,
 					TenantID:      route.TenantID,
 					TenantSlug:    route.TenantSlug,
 					TunnelName:    route.TunnelName,
