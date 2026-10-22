@@ -27,14 +27,27 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	srv := server.New(cfg, log)
+	srv, err := server.New(cfg, log)
+	if err != nil {
+		log.Error("init server", "err", err)
+		os.Exit(1)
+	}
 	log.Info("server starting",
 		"listen", cfg.Listen,
 		"http_gateway", cfg.HTTPGateway,
+		"https_gateway", cfg.HTTPSGateway,
 		"public_host", cfg.PublicHost,
+		"dashboard", "http://127.0.0.1"+normalizePort(cfg.HTTPGateway)+"/dashboard/",
 	)
 	if err := srv.Run(ctx); err != nil {
 		log.Error("server stopped", "err", err)
 		os.Exit(1)
 	}
+}
+
+func normalizePort(addr string) string {
+	if len(addr) > 0 && addr[0] == ':' {
+		return addr
+	}
+	return ":" + addr
 }

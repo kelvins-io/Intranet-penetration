@@ -9,12 +9,21 @@ import (
 )
 
 type ServerConfig struct {
-	Listen       string        `yaml:"listen"`        // agent control/data mux listen, e.g. :7000
-	HTTPGateway  string        `yaml:"http_gateway"`  // shared HTTP reverse proxy, e.g. :8080
-	Token        string        `yaml:"token"`
+	Listen       string        `yaml:"listen"`       // agent mux, e.g. :7700
+	HTTPGateway  string        `yaml:"http_gateway"` // HTTP reverse proxy + dashboard
+	HTTPSGateway string        `yaml:"https_gateway"`
+	Token        string        `yaml:"token"` // bootstrap agent token (compat)
 	TCPPortMin   int           `yaml:"tcp_port_min"`
 	TCPPortMax   int           `yaml:"tcp_port_max"`
-	PublicHost   string        `yaml:"public_host"` // advertised host in assignments
+	PublicHost   string        `yaml:"public_host"`
+	BaseDomain   string        `yaml:"base_domain"` // e.g. tunnel.local → {name}.{slug}.tunnel.local
+	DataDir      string        `yaml:"data_dir"`
+	AdminEmail   string        `yaml:"admin_email"`
+	AdminPassword string       `yaml:"admin_password"`
+	AdminAPIKey  string        `yaml:"admin_api_key"`
+	TLSCert      string        `yaml:"tls_cert"`
+	TLSKey       string        `yaml:"tls_key"`
+	AutoTLS      bool          `yaml:"auto_tls"`
 	ReadTimeout  time.Duration `yaml:"read_timeout"`
 	WriteTimeout time.Duration `yaml:"write_timeout"`
 }
@@ -24,6 +33,7 @@ type AgentTunnel struct {
 	Type       string `yaml:"type"` // tcp | http
 	LocalAddr  string `yaml:"local_addr"`
 	RemotePort int    `yaml:"remote_port"`
+	Domain     string `yaml:"domain"` // optional custom domain
 }
 
 type AgentConfig struct {
@@ -36,22 +46,31 @@ type AgentConfig struct {
 
 func LoadServer(path string) (*ServerConfig, error) {
 	cfg := &ServerConfig{
-		Listen:       ":7700",
-		HTTPGateway:  ":8088",
-		TCPPortMin:   20000,
-		TCPPortMax:   30000,
-		PublicHost:   "127.0.0.1",
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Listen:        ":7700",
+		HTTPGateway:   ":8088",
+		HTTPSGateway:  ":8443",
+		TCPPortMin:    20000,
+		TCPPortMax:    30000,
+		PublicHost:    "127.0.0.1",
+		BaseDomain:    "tunnel.local",
+		DataDir:       "data",
+		AdminEmail:    "admin@localhost",
+		AdminPassword: "admin123",
+		AutoTLS:       true,
+		ReadTimeout:   30 * time.Second,
+		WriteTimeout:  30 * time.Second,
 	}
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
 	}
 	if cfg.Token == "" {
-		return nil, fmt.Errorf("server token is required")
+		return nil, fmt.Errorf("server token is required (bootstrap agent token)")
 	}
 	if cfg.TCPPortMin <= 0 || cfg.TCPPortMax <= cfg.TCPPortMin {
 		return nil, fmt.Errorf("invalid tcp port range")
+	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = "data"
 	}
 	return cfg, nil
 }

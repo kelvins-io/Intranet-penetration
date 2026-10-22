@@ -6,7 +6,7 @@ tunnels:
   - name: demo
     type: http
     local_addr: "127.0.0.1:9000"
+    # domain: "demo.example.com"  # optional custom domain
   - name: echo-tcp
     type: tcp
     local_addr: "127.0.0.1:9001"
-    # remote_port: 20001  # optional; server assigns if omitted

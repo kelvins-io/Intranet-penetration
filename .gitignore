@@ -1,4 +1,5 @@
 bin/
+data/
 *.exe
 *.test
 *.out
@@ -6,3 +7,5 @@ bin/
 .idea/
 .vscode/
 *.log
+*.crt
+*.key

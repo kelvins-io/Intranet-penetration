@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -15,8 +14,17 @@ import (
 )
 
 func (s *Server) serveHTTPGateway(ctx context.Context, ln net.Listener) {
+	mux := http.NewServeMux()
+	s.mountAPI(mux)
+	s.mountDashboard(mux)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/", s.handlePublicHTTP)
+
 	srv := &http.Server{
-		Handler:           http.HandlerFunc(s.handleHTTP),
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
@@ -26,51 +34,31 @@ func (s *Server) serveHTTPGateway(ctx context.Context, ln net.Listener) {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-		s.log.Error("http gateway stopped", "err", err)
+		s.log.Debug("http gateway stopped", "err", err)
 	}
 }
 
-func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/healthz" {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-		return
-	}
-	if r.URL.Path == "/api/tunnels" {
-		s.handleListTunnels(w, r)
+func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
+	tenantID, name, rest, ok := s.resolveHTTPTarget(r)
+	if !ok {
+		http.Error(w, "tunnel not found; use /{tenant}/{tunnel}/... or Host {tunnel}.{tenant}."+s.cfg.BaseDomain, http.StatusNotFound)
 		return
 	}
 
-	name, rest, ok := splitTunnelPath(r.URL.Path)
-	if !ok {
-		// Host-based routing: demo.localhost / demo.tunnel.local
-		if hostName := tunnelFromHost(r.Host); hostName != "" {
-			name = hostName
-			rest = r.URL.Path
-			if rest == "" {
-				rest = "/"
-			}
-			ok = true
-		}
-	}
-	if !ok {
-		http.Error(w, "usage: /{tunnel_name}/... or Host {name}.tunnel.local", http.StatusNotFound)
-		return
-	}
-
-	route, exists := s.registry.Get(name)
+	route, exists := s.registry.Get(tenantID, name)
 	if !exists || route.Type != protocol.TunnelHTTP {
-		http.Error(w, fmt.Sprintf("tunnel %q not found or not http", name), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("tunnel %q offline or not http", name), http.StatusBadGateway)
 		return
 	}
 
-	stream, err := s.registry.OpenToAgent(name, r.RemoteAddr)
+	stream, err := s.registry.OpenToAgent(tenantID, name, r.RemoteAddr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	// Rewrite path so upstream sees the residual path.
+	s.store.Audit(tenantID, "public", "http.access", name, r.Method+" "+r.URL.Path+" from "+r.RemoteAddr)
+
 	outReq := r.Clone(r.Context())
 	outReq.URL = &url.URL{
 		Scheme:   "http",
@@ -81,7 +69,6 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq.RequestURI = ""
 
 	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return stream, nil
@@ -93,11 +80,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(rw, "bad gateway", http.StatusBadGateway)
 			_ = stream.Close()
 		},
-		ModifyResponse: func(resp *http.Response) error {
-			return nil
-		},
 	}
-	// Force director to use rewritten URL.
 	proxy.Director = func(req *http.Request) {
 		*req = *outReq
 		req.Host = outReq.Host
@@ -105,53 +88,68 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	routes := s.registry.List()
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = io.WriteString(w, "[")
-	for i, route := range routes {
-		if i > 0 {
-			_, _ = io.WriteString(w, ",")
-		}
-		_, _ = fmt.Fprintf(w,
-			`{"name":%q,"type":%q,"agent_id":%q,"public_addr":%q,"local":%q}`,
-			route.TunnelName, route.Type, route.AgentID, route.PublicAddr, route.LocalHint,
-		)
-	}
-	_, _ = io.WriteString(w, "]")
-}
+func (s *Server) resolveHTTPTarget(r *http.Request) (tenantID, name, rest string, ok bool) {
+	host := stripHostPort(r.Host)
 
-func splitTunnelPath(path string) (name, rest string, ok bool) {
-	path = strings.TrimPrefix(path, "/")
-	if path == "" {
-		return "", "", false
+	// 1) Custom / assigned domain exact match
+	if route, found := s.registry.GetByHost(host); found {
+		return route.TenantID, route.TunnelName, ensurePath(r.URL.Path), true
 	}
-	parts := strings.SplitN(path, "/", 2)
-	name = parts[0]
-	if name == "" || name == "healthz" || name == "api" {
-		return "", "", false
+	if rec, err := s.store.FindTunnelByDomain(host); err == nil {
+		return rec.TenantID, rec.Name, ensurePath(r.URL.Path), true
+	}
+
+	// 2) Subdomain: {tunnel}.{tenant}.{base}
+	base := strings.ToLower(s.cfg.BaseDomain)
+	if base != "" && strings.HasSuffix(host, "."+base) {
+		prefix := strings.TrimSuffix(host, "."+base)
+		parts := strings.Split(prefix, ".")
+		if len(parts) == 2 {
+			tunName, slug := parts[0], parts[1]
+			if ten, err := s.store.GetTenantBySlug(slug); err == nil {
+				return ten.ID, tunName, ensurePath(r.URL.Path), true
+			}
+		}
+	}
+
+	// 3) Path: /{tenant_slug}/{tunnel}/...
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path == "" || strings.HasPrefix(path, "api/") || strings.HasPrefix(path, "dashboard") {
+		return "", "", "", false
+	}
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) < 2 {
+		return "", "", "", false
+	}
+	slug, tunName := parts[0], parts[1]
+	if slug == "healthz" || slug == "api" || slug == "dashboard" {
+		return "", "", "", false
+	}
+	ten, err := s.store.GetTenantBySlug(slug)
+	if err != nil {
+		return "", "", "", false
 	}
 	rest = "/"
-	if len(parts) == 2 {
-		rest = "/" + parts[1]
+	if len(parts) == 3 {
+		rest = "/" + parts[2]
 	}
-	return name, rest, true
+	return ten.ID, tunName, rest, true
 }
 
-func tunnelFromHost(host string) string {
+func stripHostPort(host string) string {
 	h, _, err := net.SplitHostPort(host)
 	if err != nil {
-		h = host
+		return strings.ToLower(host)
 	}
-	h = strings.ToLower(h)
-	for _, suffix := range []string{".tunnel.local", ".localhost", ".tunnel"} {
-		if strings.HasSuffix(h, suffix) {
-			return strings.TrimSuffix(h, suffix)
-		}
+	return strings.ToLower(h)
+}
+
+func ensurePath(p string) string {
+	if p == "" {
+		return "/"
 	}
-	return ""
+	if !strings.HasPrefix(p, "/") {
+		return "/" + p
+	}
+	return p
 }

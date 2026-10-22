@@ -1,6 +1,15 @@
 listen: ":7700"
 http_gateway: ":8088"
+https_gateway: ":8443"
 token: "dev-token-change-me"
 public_host: "127.0.0.1"
+base_domain: "tunnel.local"
+data_dir: "data"
+admin_email: "admin@localhost"
+admin_password: "admin123"
+# admin_api_key: ""   # auto-generated on first boot; check data/store.json
+tls_cert: "server.crt"
+tls_key: "server.key"
+auto_tls: true
 tcp_port_min: 20000
 tcp_port_max: 30000

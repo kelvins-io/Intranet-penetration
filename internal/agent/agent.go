@@ -68,6 +68,7 @@ func (a *Agent) connectOnce(ctx context.Context) error {
 			Type:       protocol.TunnelType(t.Type),
 			LocalAddr:  t.LocalAddr,
 			RemotePort: t.RemotePort,
+			Domain:     t.Domain,
 		})
 	}
 

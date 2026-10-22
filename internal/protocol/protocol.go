@@ -39,6 +39,8 @@ type TunnelSpec struct {
 	LocalAddr string     `json:"local_addr"` // e.g. 127.0.0.1:3000
 	// RemotePort is optional for TCP tunnels; 0 means server assigns.
 	RemotePort int `json:"remote_port,omitempty"`
+	// Domain is an optional custom hostname for HTTP tunnels.
+	Domain string `json:"domain,omitempty"`
 }
 
 type Hello struct {
@@ -53,13 +55,15 @@ type AssignedTunnel struct {
 	Type       TunnelType `json:"type"`
 	PublicAddr string     `json:"public_addr"` // host:port or http host hint
 	RemotePort int        `json:"remote_port,omitempty"`
+	Domain     string     `json:"domain,omitempty"`
 }
 
 type HelloAck struct {
-	Version int              `json:"version"`
-	AgentID string           `json:"agent_id"`
-	Tunnels []AssignedTunnel `json:"tunnels"`
-	Message string           `json:"message,omitempty"`
+	Version  int              `json:"version"`
+	AgentID  string           `json:"agent_id"`
+	TenantID string           `json:"tenant_id,omitempty"`
+	Tunnels  []AssignedTunnel `json:"tunnels"`
+	Message  string           `json:"message,omitempty"`
 }
 
 // OpenRequest is sent by the server on a new yamux stream before raw bytes.

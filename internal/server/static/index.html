@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Intranet Penetration Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a222c;
+      --line: #2a3542;
+      --text: #e7eef7;
+      --muted: #8b9bb0;
+      --accent: #3d8bfd;
+      --ok: #3ecf8e;
+      --warn: #f0b429;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 20px 28px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; letter-spacing: 0.02em; }
+    main { padding: 24px 28px; display: grid; gap: 20px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 16px;
+    }
+    .card .label { color: var(--muted); font-size: 12px; }
+    .card .value { font-size: 28px; margin-top: 8px; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-weight: 500; }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      border: 1px solid var(--line);
+    }
+    .pill.on { color: var(--ok); border-color: #245c44; }
+    .pill.off { color: var(--muted); }
+    input, button {
+      background: #121820;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font: inherit;
+    }
+    button {
+      background: var(--accent);
+      border-color: transparent;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button.secondary { background: transparent; border-color: var(--line); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .muted { color: var(--muted); font-size: 12px; }
+    #login { max-width: 420px; margin: 80px auto; }
+    #login .card { display: grid; gap: 12px; }
+    .hidden { display: none !important; }
+    h2 { font-size: 15px; margin: 0 0 12px; }
+    code { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div id="login">
+    <div class="card">
+      <h1>控制台登录</h1>
+      <p class="muted">使用管理员邮箱密码，或直接粘贴 API Key。</p>
+      <input id="email" placeholder="admin@localhost" value="admin@localhost" />
+      <input id="password" type="password" placeholder="password" value="admin123" />
+      <input id="apikey" placeholder="或粘贴 API Key" />
+      <button id="btnLogin">登录</button>
+      <div id="loginErr" class="muted"></div>
+    </div>
+  </div>
+
+  <div id="app" class="hidden">
+    <header>
+      <div>
+        <h1>Intranet Penetration</h1>
+        <div class="muted" id="whoami"></div>
+      </div>
+      <div class="row">
+        <button class="secondary" id="btnRefresh">刷新</button>
+        <button class="secondary" id="btnLogout">退出</button>
+      </div>
+    </header>
+    <main>
+      <section class="grid" id="stats"></section>
+      <section class="card">
+        <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2>隧道</h2>
+          <div class="row">
+            <input id="domainName" placeholder="隧道名" style="width:120px" />
+            <input id="domainValue" placeholder="自定义域名 example.com" style="width:220px" />
+            <button id="btnDomain">绑定域名</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>公网</th><th>域名</th><th>Agent</th></tr></thead>
+          <tbody id="tunnels"></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2>Agent Token</h2>
+          <div class="row">
+            <input id="tokenName" placeholder="token 名称" value="agent" />
+            <button id="btnToken">创建</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>名称</th><th>Token</th><th>状态</th><th>创建时间</th></tr></thead>
+          <tbody id="tokens"></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <h2>审计日志</h2>
+        <table>
+          <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>详情</th></tr></thead>
+          <tbody id="audits"></tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const state = { key: localStorage.getItem('ip_api_key') || '' };
+
+    async function api(path, opts = {}) {
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+      if (state.key) headers['Authorization'] = 'Bearer ' + state.key;
+      const res = await fetch(path, { ...opts, headers });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    }
+
+    function showApp(on) {
+      document.getElementById('login').classList.toggle('hidden', on);
+      document.getElementById('app').classList.toggle('hidden', !on);
+    }
+
+    async function login() {
+      const err = document.getElementById('loginErr');
+      err.textContent = '';
+      try {
+        const keyInput = document.getElementById('apikey').value.trim();
+        if (keyInput) {
+          state.key = keyInput;
+        } else {
+          const data = await api('/api/v1/auth/login', {
+            method: 'POST',
+            body: JSON.stringify({
+              email: document.getElementById('email').value,
+              password: document.getElementById('password').value,
+            }),
+          });
+          state.key = data.api_key;
+        }
+        localStorage.setItem('ip_api_key', state.key);
+        await refresh();
+        showApp(true);
+      } catch (e) {
+        err.textContent = e.message;
+      }
+    }
+
+    async function refresh() {
+      const me = await api('/api/v1/me');
+      document.getElementById('whoami').textContent =
+        me.user.email + ' · ' + me.tenant.name + ' (' + me.tenant.slug + ')';
+
+      const stats = await api('/api/v1/stats');
+      document.getElementById('stats').innerHTML = [
+        ['在线 Agent', stats.online_agents],
+        ['隧道数', stats.tunnels],
+        ['TCP 隧道', stats.tcp_tunnels],
+        ['配额 Tunnels', stats.quota.max_tunnels],
+      ].map(([l, v]) => `<div class="card"><div class="label">${l}</div><div class="value">${v}</div></div>`).join('');
+
+      const tunnels = await api('/api/v1/tunnels');
+      document.getElementById('tunnels').innerHTML = tunnels.map(t => `
+        <tr>
+          <td><code>${t.name}</code></td>
+          <td>${t.type}</td>
+          <td><span class="pill ${t.online ? 'on' : 'off'}">${t.online ? 'online' : 'offline'}</span></td>
+          <td class="muted">${t.public_addr || '-'}</td>
+          <td>${t.domain || '-'}</td>
+          <td class="muted">${t.agent_id || '-'}</td>
+        </tr>`).join('') || '<tr><td colspan="6" class="muted">暂无隧道</td></tr>';
+
+      const tokens = await api('/api/v1/tokens');
+      document.getElementById('tokens').innerHTML = tokens.map(t => `
+        <tr>
+          <td>${t.name}</td>
+          <td><code>${t.token}</code></td>
+          <td>${t.revoked ? 'revoked' : 'active'}</td>
+          <td class="muted">${new Date(t.created_at).toLocaleString()}</td>
+        </tr>`).join('');
+
+      const audits = await api('/api/v1/audit?limit=30');
+      document.getElementById('audits').innerHTML = audits.map(a => `
+        <tr>
+          <td class="muted">${new Date(a.created_at).toLocaleString()}</td>
+          <td>${a.actor}</td>
+          <td>${a.action}</td>
+          <td>${a.target || '-'}</td>
+          <td class="muted">${a.detail || ''}</td>
+        </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无审计</td></tr>';
+    }
+
+    document.getElementById('btnLogin').onclick = login;
+    document.getElementById('btnRefresh').onclick = () => refresh().catch(alert);
+    document.getElementById('btnLogout').onclick = () => {
+      localStorage.removeItem('ip_api_key');
+      state.key = '';
+      showApp(false);
+    };
+    document.getElementById('btnToken').onclick = async () => {
+      await api('/api/v1/tokens', {
+        method: 'POST',
+        body: JSON.stringify({ name: document.getElementById('tokenName').value || 'agent' }),
+      });
+      await refresh();
+    };
+    document.getElementById('btnDomain').onclick = async () => {
+      await api('/api/v1/tunnels/domain', {
+        method: 'PUT',
+        body: JSON.stringify({
+          name: document.getElementById('domainName').value,
+          domain: document.getElementById('domainValue').value,
+        }),
+      });
+      await refresh();
+    };
+
+    if (state.key) {
+      refresh().then(() => showApp(true)).catch(() => showApp(false));
+    }
+  </script>
+</body>
+</html>
