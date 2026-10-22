@@ -1,12 +1,14 @@
 server_addr: "127.0.0.1:7700"
+quic_addr: "127.0.0.1:7700"
+prefer_quic: true
 token: "dev-token-change-me"
 agent_id: "dev-agent"
 reconnect: 3s
+resume_token_file: "data/agent_resume.token"
 tunnels:
   - name: demo
     type: http
     local_addr: "127.0.0.1:9000"
-    # domain: "demo.example.com"  # optional custom domain
   - name: echo-tcp
     type: tcp
     local_addr: "127.0.0.1:9001"

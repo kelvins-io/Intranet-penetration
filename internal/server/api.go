@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,6 +19,9 @@ type apiUser struct {
 
 func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
+	mux.HandleFunc("/api/v1/auth/oidc/login", s.handleOIDCLogin)
+	mux.HandleFunc("/api/v1/auth/oidc/callback", s.handleOIDCCallback)
+	mux.HandleFunc("/api/v1/auth/oidc/status", s.handleOIDCStatus)
 	mux.HandleFunc("/api/v1/me", s.withAuth(s.handleMe))
 	mux.HandleFunc("/api/v1/tenants", s.withAuth(s.handleTenants))
 	mux.HandleFunc("/api/v1/tokens", s.withAuth(s.handleTokens))
@@ -24,6 +29,7 @@ func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/tunnels/domain", s.withAuth(s.handleTunnelDomain))
 	mux.HandleFunc("/api/v1/audit", s.withAuth(s.handleAudit))
 	mux.HandleFunc("/api/v1/stats", s.withAuth(s.handleStats))
+	mux.HandleFunc("/api/v1/cluster", s.withAuth(s.handleCluster))
 	// backward compatible
 	mux.HandleFunc("/api/tunnels", s.handleLegacyTunnels)
 }
@@ -217,13 +223,91 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, au *apiUser
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, au *apiUser) {
 	total, tcp := s.store.CountTunnels(au.Tenant.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"tenant":         au.Tenant,
-		"online_agents":  s.store.CountOnlineAgents(au.Tenant.ID),
-		"tunnels":        total,
-		"tcp_tunnels":    tcp,
-		"live_routes":    len(s.registry.List()),
-		"quota":          au.Tenant.Quota,
+		"tenant":        au.Tenant,
+		"online_agents": s.store.CountOnlineAgents(au.Tenant.ID),
+		"tunnels":       total,
+		"tcp_tunnels":   tcp,
+		"live_routes":   len(s.registry.List()),
+		"quota":         au.Tenant.Quota,
+		"edge_id":       s.cfg.EdgeID,
+		"oidc_enabled":  s.oidc != nil,
 	})
+}
+
+func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"edge_id":        s.cfg.EdgeID,
+		"advertise_http": s.cfg.Cluster.AdvertiseHTTP,
+		"edges":          s.cluster.ListEdges(),
+		"tunnels":        s.cluster.ListTunnels(),
+		"redis":          s.cfg.Cluster.RedisURL != "",
+	})
+}
+
+func (s *Server) handleOIDCStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": s.oidc != nil,
+		"issuer": func() string {
+			if s.cfg.OIDC.Enabled {
+				return s.cfg.OIDC.Issuer
+			}
+			return ""
+		}(),
+	})
+}
+
+func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
+	if s.oidc == nil {
+		writeErr(w, http.StatusNotImplemented, "oidc disabled")
+		return
+	}
+	state := randomState()
+	http.SetCookie(w, &http.Cookie{
+		Name:     "oidc_state",
+		Value:    state,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   600,
+	})
+	http.Redirect(w, r, s.oidc.AuthCodeURL(state), http.StatusFound)
+}
+
+func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
+	if s.oidc == nil {
+		writeErr(w, http.StatusNotImplemented, "oidc disabled")
+		return
+	}
+	state := r.URL.Query().Get("state")
+	cookie, err := r.Cookie("oidc_state")
+	if err != nil || cookie.Value == "" || cookie.Value != state || !s.oidc.ValidateState(state) {
+		writeErr(w, http.StatusBadRequest, "invalid oidc state")
+		return
+	}
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		writeErr(w, http.StatusBadRequest, "missing code")
+		return
+	}
+	claims, err := s.oidc.Exchange(r.Context(), code)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	u, ten, err := s.store.UpsertOIDCUser(claims.Email, claims.Name, "")
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.store.Audit(ten.ID, u.Email, "auth.oidc", u.ID, claims.Sub)
+	// Redirect to dashboard with api key fragment for SPA pickup.
+	http.Redirect(w, r, "/dashboard/#api_key="+u.APIKey, http.StatusFound)
+}
+
+func randomState() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 func (s *Server) handleLegacyTunnels(w http.ResponseWriter, r *http.Request) {

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
@@ -13,15 +16,18 @@ import (
 )
 
 type Agent struct {
-	cfg *config.AgentConfig
-	log *slog.Logger
+	cfg         *config.AgentConfig
+	log         *slog.Logger
+	resumeToken string
 }
 
 func New(cfg *config.AgentConfig, log *slog.Logger) *Agent {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Agent{cfg: cfg, log: log}
+	a := &Agent{cfg: cfg, log: log}
+	a.resumeToken = a.loadResumeToken()
+	return a
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -44,23 +50,18 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (a *Agent) connectOnce(ctx context.Context) error {
-	d := net.Dialer{Timeout: 10 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", a.cfg.ServerAddr)
-	if err != nil {
-		return fmt.Errorf("dial server: %w", err)
-	}
-	defer conn.Close()
-
-	sess, err := tunnel.ClientSession(conn)
+	sess, transport, err := a.dial(ctx)
 	if err != nil {
 		return err
 	}
 	defer sess.Close()
+	a.log.Info("connected", "transport", transport)
 
 	hello := protocol.Hello{
-		Version: protocol.Version,
-		Token:   a.cfg.Token,
-		AgentID: a.cfg.AgentID,
+		Version:     protocol.Version,
+		Token:       a.cfg.Token,
+		AgentID:     a.cfg.AgentID,
+		ResumeToken: a.resumeToken,
 	}
 	for _, t := range a.cfg.Tunnels {
 		hello.Tunnels = append(hello.Tunnels, protocol.TunnelSpec{
@@ -76,8 +77,18 @@ func (a *Agent) connectOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if ack.ResumeToken != "" {
+		a.resumeToken = ack.ResumeToken
+		_ = a.saveResumeToken(ack.ResumeToken)
+	}
 	for _, t := range ack.Tunnels {
-		a.log.Info("tunnel assigned", "name", t.Name, "type", t.Type, "public", t.PublicAddr)
+		a.log.Info("tunnel assigned",
+			"name", t.Name,
+			"type", t.Type,
+			"public", t.PublicAddr,
+			"resumed", ack.Resumed,
+			"edge", ack.EdgeID,
+		)
 	}
 
 	errCh := make(chan error, 1)
@@ -93,6 +104,31 @@ func (a *Agent) connectOnce(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func (a *Agent) dial(ctx context.Context) (*tunnel.Session, string, error) {
+	tryQUIC := a.cfg.PreferQUIC
+	if tryQUIC {
+		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		sess, err := tunnel.ClientQUICSession(qctx, a.cfg.QUICAddr, nil)
+		cancel()
+		if err == nil {
+			return sess, "quic", nil
+		}
+		a.log.Warn("quic dial failed, fallback tcp", "err", err)
+	}
+
+	d := net.Dialer{Timeout: 10 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", a.cfg.ServerAddr)
+	if err != nil {
+		return nil, "", fmt.Errorf("dial tcp: %w", err)
+	}
+	sess, err := tunnel.ClientSession(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, "", err
+	}
+	return sess, "tcp", nil
 }
 
 func (a *Agent) serveStreams(ctx context.Context, sess *tunnel.Session) error {
@@ -137,4 +173,27 @@ func (a *Agent) localAddrFor(name string) string {
 		}
 	}
 	return ""
+}
+
+func (a *Agent) loadResumeToken() string {
+	path := a.cfg.ResumeTokenFile
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func (a *Agent) saveResumeToken(tok string) error {
+	path := a.cfg.ResumeTokenFile
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(tok), 0o600)
 }

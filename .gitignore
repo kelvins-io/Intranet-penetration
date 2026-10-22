@@ -1,5 +1,6 @@
 bin/
 data/
+data/agent_resume.token
 *.exe
 *.test
 *.out

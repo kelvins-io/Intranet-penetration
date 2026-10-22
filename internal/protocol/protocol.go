@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version = 1
+	Version = 2
 
 	MaxFrameSize = 1 << 20 // 1 MiB
 )
@@ -44,10 +44,11 @@ type TunnelSpec struct {
 }
 
 type Hello struct {
-	Version int          `json:"version"`
-	Token   string       `json:"token"`
-	AgentID string       `json:"agent_id"`
-	Tunnels []TunnelSpec `json:"tunnels"`
+	Version     int          `json:"version"`
+	Token       string       `json:"token"`
+	AgentID     string       `json:"agent_id"`
+	ResumeToken string       `json:"resume_token,omitempty"`
+	Tunnels     []TunnelSpec `json:"tunnels"`
 }
 
 type AssignedTunnel struct {
@@ -59,11 +60,15 @@ type AssignedTunnel struct {
 }
 
 type HelloAck struct {
-	Version  int              `json:"version"`
-	AgentID  string           `json:"agent_id"`
-	TenantID string           `json:"tenant_id,omitempty"`
-	Tunnels  []AssignedTunnel `json:"tunnels"`
-	Message  string           `json:"message,omitempty"`
+	Version     int              `json:"version"`
+	AgentID     string           `json:"agent_id"`
+	TenantID    string           `json:"tenant_id,omitempty"`
+	ResumeToken string           `json:"resume_token,omitempty"`
+	Resumed     bool             `json:"resumed,omitempty"`
+	Transport   string           `json:"transport,omitempty"` // quic | tcp
+	EdgeID      string           `json:"edge_id,omitempty"`
+	Tunnels     []AssignedTunnel `json:"tunnels"`
+	Message     string           `json:"message,omitempty"`
 }
 
 // OpenRequest is sent by the server on a new yamux stream before raw bytes.

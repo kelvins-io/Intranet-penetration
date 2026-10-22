@@ -1,70 +1,67 @@
 # Intranet Penetration
 
-工业级内网穿透平台。当前进度：**P1**（多租户、HTTPS、配额/审计、Dashboard）。
+工业级内网穿透平台。当前进度：**P2**（Edge 集群、QUIC、会话恢复、OIDC）。
 
 ## 架构
 
 ```
-公网用户 ──► HTTP :8088 / HTTPS :8443 ──mux──► Agent ──► 内网服务
-公网用户 ──► TCP :20000+                 ──mux──► Agent ──► 内网服务
-Agent     ──► Mux :7700  （yamux：控制流 + 数据流）
-管理面    ──► /dashboard + /api/v1/*（Bearer API Key）
+公网用户 ──► HTTP :8088 / HTTPS :8443
+              │
+              ├─ 本地 Agent 会话 ──mux(QUIC|TCP)──► Agent ──► 内网服务
+              └─ 集群转发 /internal/forward ──► 其他 Edge
+Agent     ──► :7700 TCP + UDP(QUIC) （优先 QUIC，失败回退 TCP）
+管理面    ──► /dashboard + /api/v1/* + OIDC
+会话表    ──► 内存 或 Redis（tunnel → edge 映射）
 ```
 
 ## 快速开始
 
 ```bash
 go mod tidy
+make run-demo      # 终端1
+make run-server    # 终端2
+make run-agent     # 终端3（prefer_quic: true）
 
-# 终端 1：内网示例 HTTP 服务
-make run-demo
-
-# 终端 2：Server
-make run-server
-
-# 终端 3：Agent
-make run-agent
-
-# HTTP 穿透（多租户路径：/{tenant_slug}/{tunnel}/）
 curl http://127.0.0.1:8088/default/demo/
-
-# Dashboard
 open http://127.0.0.1:8088/dashboard/
-# 默认账号 admin@localhost / admin123
-
-# 控制面 API
-curl -u '' -H "Authorization: Bearer <api_key>" http://127.0.0.1:8088/api/v1/stats
-# api_key 见首次启动后的 data/store.json 或登录接口返回
 ```
 
-HTTPS 默认开启（`:8443`，`auto_tls` 自动生成自签证书到 `data/`）。
-
-## P1 能力
+## P2 能力
 
 | 能力 | 说明 |
 |------|------|
-| 多租户 | Tenant / User / Agent Token，隧道按租户隔离 |
-| 鉴权 | 密码登录 + API Key；Agent 使用租户 Token |
-| HTTPS | `:8443`，可配置证书或自动自签 |
-| 自定义域名 | Agent 声明 `domain`，或 Dashboard/API 绑定 |
-| 配额 | 每租户 max_agents / max_tunnels / max_tcp |
-| 审计 | 连接、访问、配置变更写入 `data/store.json` |
-| Dashboard | `/dashboard/` 查看隧道、Token、审计 |
+| **QUIC** | Agent 默认优先 QUIC（`quic_listen` / `prefer_quic`），失败自动 TCP+yamux |
+| **会话恢复** | HelloAck 下发 `resume_token`；断线后短时重连复用域名/端口 |
+| **Edge 集群** | `edge_id` + 共享 Registry（内存/Redis）+ Peer HTTP 转发 |
+| **OIDC** | `/api/v1/auth/oidc/login` → 回调签发 API Key，Dashboard 可一键登录 |
 
-### 路由方式
+### 集群（多 Edge）
 
-1. 路径：`http://host/{tenant_slug}/{tunnel}/...`
-2. 子域：`{tunnel}.{tenant}.{base_domain}`（默认 `*.default.tunnel.local`）
-3. 自定义域名：Host 精确匹配
+1. 各节点配置不同 `edge_id` / 端口，`cluster.advertise_http` 指向自身
+2. 可选 `cluster.redis_url` 共享隧道位置；或静态 `cluster.peers`
+3. 设置相同 `cluster.secret`，跨 Edge 经 `/internal/forward/...` 转发
 
-## 配置
+### OIDC
 
-- `configs/server.yaml`：监听、Token、TLS、管理员、数据目录
-- `configs/agent.yaml`：Server 地址、租户 Agent Token、隧道列表
+在 `configs/server.yaml` 启用：
+
+```yaml
+oidc:
+  enabled: true
+  issuer: "https://your-idp.example.com"
+  client_id: "..."
+  client_secret: "..."
+  redirect_url: "http://127.0.0.1:8088/api/v1/auth/oidc/callback"
+```
+
+## 配置要点
+
+- `configs/server.yaml`：`quic_listen`、`edge_id`、`resume_ttl`、`cluster`、`oidc`
+- `configs/agent.yaml`：`prefer_quic`、`quic_addr`、`resume_token_file`
 
 ## 路线图
 
 - **P0**：单体 Server、Token、HTTP/TCP、yamux、重连
-- **P1（当前）**：多租户、HTTPS/自定义域名、Dashboard、配额与审计
-- **P2**：Edge 集群、QUIC、会话恢复、OIDC
+- **P1**：多租户、HTTPS/自定义域名、Dashboard、配额与审计
+- **P2（当前）**：Edge 集群、QUIC、会话恢复、OIDC
 - **P3**：E2E 加密、多区域、私有化套件

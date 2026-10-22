@@ -9,14 +9,18 @@ import (
 
 	"github.com/hashicorp/yamux"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
+	"github.com/quic-go/quic-go"
 )
 
-// Session wraps a yamux session plus the dedicated control stream.
+// Session wraps either a yamux (TCP) or QUIC multiplexed connection.
 type Session struct {
-	conn    net.Conn
-	mux     *yamux.Session
-	control net.Conn
-	mu      sync.Mutex
+	conn     net.Conn
+	mux      *yamux.Session
+	quicConn *quic.Conn
+	control  net.Conn
+	closed   chan struct{}
+	mu       sync.Mutex
+	transport string // "tcp" | "quic"
 }
 
 func ServerSession(conn net.Conn) (*Session, error) {
@@ -32,7 +36,7 @@ func ServerSession(conn net.Conn) (*Session, error) {
 		_ = mux.Close()
 		return nil, fmt.Errorf("accept control stream: %w", err)
 	}
-	return &Session{conn: conn, mux: mux, control: control}, nil
+	return &Session{conn: conn, mux: mux, control: control, transport: "tcp"}, nil
 }
 
 func ClientSession(conn net.Conn) (*Session, error) {
@@ -48,7 +52,17 @@ func ClientSession(conn net.Conn) (*Session, error) {
 		_ = mux.Close()
 		return nil, fmt.Errorf("open control stream: %w", err)
 	}
-	return &Session{conn: conn, mux: mux, control: control}, nil
+	return &Session{conn: conn, mux: mux, control: control, transport: "tcp"}, nil
+}
+
+func (s *Session) Transport() string {
+	if s.transport != "" {
+		return s.transport
+	}
+	if s.quicConn != nil {
+		return "quic"
+	}
+	return "tcp"
 }
 
 func (s *Session) Control() net.Conn {
@@ -56,10 +70,16 @@ func (s *Session) Control() net.Conn {
 }
 
 func (s *Session) OpenStream() (net.Conn, error) {
+	if s.quicConn != nil {
+		return s.openQUICStream()
+	}
 	return s.mux.Open()
 }
 
 func (s *Session) AcceptStream() (net.Conn, error) {
+	if s.quicConn != nil {
+		return s.acceptQUICStream()
+	}
 	return s.mux.Accept()
 }
 
@@ -72,6 +92,9 @@ func (s *Session) Close() error {
 	if s.mux != nil {
 		_ = s.mux.Close()
 	}
+	if s.quicConn != nil {
+		_ = s.quicConn.CloseWithError(0, "bye")
+	}
 	if s.conn != nil {
 		return s.conn.Close()
 	}
@@ -79,10 +102,24 @@ func (s *Session) Close() error {
 }
 
 func (s *Session) IsClosed() bool {
+	if s.quicConn != nil {
+		select {
+		case <-s.quicConn.Context().Done():
+			return true
+		default:
+			return false
+		}
+	}
 	return s.mux.IsClosed()
 }
 
 func (s *Session) CloseChan() <-chan struct{} {
+	if s.quicConn != nil {
+		if s.closed == nil {
+			s.closed = make(chan struct{})
+		}
+		return s.closed
+	}
 	return s.mux.CloseChan()
 }
 
@@ -106,6 +143,9 @@ func (s *Session) HandshakeAsServer(validate func(protocol.Hello) (*protocol.Hel
 			Message: err.Error(),
 		})
 		return &hello, nil, err
+	}
+	if ack.Transport == "" {
+		ack.Transport = s.Transport()
 	}
 	if err := protocol.WriteJSON(s.control, protocol.MsgHelloAck, ack); err != nil {
 		return &hello, nil, err
@@ -141,7 +181,7 @@ func (s *Session) HandshakeAsClient(hello protocol.Hello) (*protocol.HelloAck, e
 	}
 }
 
-// OpenDataStream opens a yamux stream and writes an OpenRequest header.
+// OpenDataStream opens a multiplexed stream and writes an OpenRequest header.
 func (s *Session) OpenDataStream(tunnel, meta string) (net.Conn, error) {
 	stream, err := s.OpenStream()
 	if err != nil {

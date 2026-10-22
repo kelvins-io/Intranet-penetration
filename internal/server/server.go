@@ -9,18 +9,27 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/kelvins-io/Intranet-penetration/internal/authoidc"
+	"github.com/kelvins-io/Intranet-penetration/internal/cluster"
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
+	"github.com/kelvins-io/Intranet-penetration/internal/resume"
 	"github.com/kelvins-io/Intranet-penetration/internal/store"
 	"github.com/kelvins-io/Intranet-penetration/internal/tlsutil"
 	"github.com/kelvins-io/Intranet-penetration/internal/tunnel"
+	"github.com/quic-go/quic-go"
 )
 
 type Server struct {
 	cfg      *config.ServerConfig
 	registry *Registry
 	store    *store.Store
+	cluster  cluster.Registry
+	resume   *resume.Store
+	oidc     *authoidc.Provider
+	tlsConf  *tls.Config
 	log      *slog.Logger
 
 	mu        sync.Mutex
@@ -43,10 +52,46 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 	if err := st.Bootstrap(cfg.AdminEmail, cfg.AdminPassword, cfg.AdminAPIKey, cfg.Token); err != nil {
 		return nil, err
 	}
+
+	var clus cluster.Registry = cluster.NewMemory()
+	if cfg.Cluster.RedisURL != "" {
+		r, err := cluster.NewRedis(cfg.Cluster.RedisURL)
+		if err != nil {
+			return nil, fmt.Errorf("cluster redis: %w", err)
+		}
+		clus = r
+		log.Info("cluster registry", "backend", "redis")
+	} else {
+		log.Info("cluster registry", "backend", "memory")
+	}
+
+	oidcProv, err := authoidc.New(cfg.OIDC)
+	if err != nil {
+		return nil, fmt.Errorf("oidc: %w", err)
+	}
+
+	needTLS := cfg.AutoTLS || cfg.QUICListen != "" || cfg.HTTPSGateway != ""
+	var tlsConf *tls.Config
+	if needTLS {
+		tlsConf, err = tlsutil.LoadOrGenerate(
+			absPath(cfg.DataDir, cfg.TLSCert),
+			absPath(cfg.DataDir, cfg.TLSKey),
+			cfg.AutoTLS || cfg.TLSCert == "",
+			[]string{cfg.PublicHost, "localhost", cfg.BaseDomain, "*." + cfg.BaseDomain},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("tls: %w", err)
+		}
+	}
+
 	return &Server{
 		cfg:      cfg,
 		registry: NewRegistry(),
 		store:    st,
+		cluster:  clus,
+		resume:   resume.New(cfg.ResumeTTL),
+		oidc:     oidcProv,
+		tlsConf:  tlsConf,
 		log:      log,
 		tcpStops: make(map[string]context.CancelFunc),
 	}, nil
@@ -55,10 +100,26 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 func (s *Server) Run(ctx context.Context) error {
 	agentLn, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
-		return fmt.Errorf("listen agent: %w", err)
+		return fmt.Errorf("listen agent tcp: %w", err)
 	}
 	s.trackListener(agentLn)
-	s.log.Info("agent mux listening", "addr", agentLn.Addr().String())
+	s.log.Info("agent mux listening", "transport", "tcp", "addr", agentLn.Addr().String())
+
+	if s.cfg.QUICListen != "" {
+		if s.tlsConf == nil {
+			return fmt.Errorf("quic requires tls config")
+		}
+		qln, err := tunnel.ListenQUIC(s.cfg.QUICListen, s.tlsConf)
+		if err != nil {
+			return fmt.Errorf("listen agent quic: %w", err)
+		}
+		go func() {
+			<-ctx.Done()
+			_ = qln.Close()
+		}()
+		s.log.Info("agent mux listening", "transport", "quic", "addr", s.cfg.QUICListen)
+		go s.serveQUIC(ctx, qln)
+	}
 
 	httpLn, err := net.Listen("tcp", s.cfg.HTTPGateway)
 	if err != nil {
@@ -70,27 +131,26 @@ func (s *Server) Run(ctx context.Context) error {
 	go s.serveHTTPGateway(ctx, httpLn)
 
 	if s.cfg.HTTPSGateway != "" {
-		tlsCfg, err := tlsutil.LoadOrGenerate(
-			absPath(s.cfg.DataDir, s.cfg.TLSCert),
-			absPath(s.cfg.DataDir, s.cfg.TLSKey),
-			s.cfg.AutoTLS,
-			[]string{s.cfg.PublicHost, "localhost", s.cfg.BaseDomain, "*." + s.cfg.BaseDomain},
-		)
-		if err != nil {
-			return fmt.Errorf("tls: %w", err)
+		if s.tlsConf == nil {
+			return fmt.Errorf("https requires tls config")
 		}
 		raw, err := net.Listen("tcp", s.cfg.HTTPSGateway)
 		if err != nil {
 			return fmt.Errorf("listen https gateway: %w", err)
 		}
-		ln := tls.NewListener(raw, tlsCfg)
+		ln := tls.NewListener(raw, s.tlsConf)
 		s.trackListener(ln)
 		s.log.Info("https gateway listening", "addr", ln.Addr().String())
 		go s.serveHTTPGateway(ctx, ln)
 	}
 
+	_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP)
+	go s.heartbeatLoop(ctx)
+
 	s.log.Info("control plane ready",
+		"edge_id", s.cfg.EdgeID,
 		"dashboard", fmt.Sprintf("http://%s/dashboard/", s.httpAdvertiseHost()),
+		"oidc", s.oidc != nil,
 		"admin_api_key_hint", maskKey(s.store.AdminAPIKey()),
 	)
 
@@ -109,59 +169,51 @@ func (s *Server) Run(ctx context.Context) error {
 				return err
 			}
 		}
-		go s.handleAgent(ctx, conn)
+		go s.handleAgentTCP(ctx, conn)
 	}
 }
 
-func absPath(dir, p string) string {
-	if p == "" {
-		return ""
-	}
-	if filepath.IsAbs(p) {
-		return p
-	}
-	return filepath.Join(dir, p)
-}
-
-func maskKey(k string) string {
-	if len(k) <= 8 {
-		return "***"
-	}
-	return k[:4] + "..." + k[len(k)-4:]
-}
-
-func (s *Server) trackListener(ln net.Listener) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.listeners = append(s.listeners, ln)
-}
-
-func (s *Server) shutdown() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, stop := range s.tcpStops {
-		stop()
-	}
-	for _, ln := range s.listeners {
-		_ = ln.Close()
+func (s *Server) serveQUIC(ctx context.Context, ln *quic.Listener) {
+	for {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				s.log.Debug("quic accept", "err", err)
+				return
+			}
+		}
+		go s.handleAgentQUIC(ctx, conn)
 	}
 }
 
-// Close releases runtime resources (listeners are closed via shutdown).
-func (s *Server) Close() {
-	s.shutdown()
-}
-
-func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
+func (s *Server) handleAgentTCP(ctx context.Context, conn net.Conn) {
 	remote := conn.RemoteAddr().String()
-	s.log.Info("agent connected", "remote", remote)
+	s.log.Info("agent connected", "remote", remote, "transport", "tcp")
 	defer conn.Close()
-
 	sess, err := tunnel.ServerSession(conn)
 	if err != nil {
 		s.log.Debug("yamux server", "err", err, "remote", remote)
 		return
 	}
+	s.serveAgentSession(ctx, sess, remote)
+}
+
+func (s *Server) handleAgentQUIC(ctx context.Context, conn *quic.Conn) {
+	remote := conn.RemoteAddr().String()
+	s.log.Info("agent connected", "remote", remote, "transport", "quic")
+	defer conn.CloseWithError(0, "done")
+	sess, err := tunnel.ServerQUICSession(conn)
+	if err != nil {
+		s.log.Debug("quic session", "err", err, "remote", remote)
+		return
+	}
+	s.serveAgentSession(ctx, sess, remote)
+}
+
+func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, remote string) {
 	defer sess.Close()
 
 	var tenant *store.Tenant
@@ -171,6 +223,8 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 			return nil, err
 		}
 		tenant = t
+		a.Transport = sess.Transport()
+		a.EdgeID = s.cfg.EdgeID
 		return a, nil
 	})
 	if err != nil {
@@ -181,8 +235,10 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		"agent_id", ack.AgentID,
 		"tenant", tenant.Slug,
 		"tunnels", len(ack.Tunnels),
+		"resumed", ack.Resumed,
+		"transport", ack.Transport,
 	)
-	s.store.Audit(tenant.ID, ack.AgentID, "agent.connect", ack.AgentID, remote)
+	s.store.Audit(tenant.ID, ack.AgentID, "agent.connect", ack.AgentID, remote+" "+ack.Transport)
 
 	for _, assigned := range ack.Tunnels {
 		route := &Route{
@@ -217,6 +273,18 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 			AgentID:    ack.AgentID,
 			Online:     true,
 		})
+		_ = s.cluster.Put(cluster.TunnelLocation{
+			EdgeID:        s.cfg.EdgeID,
+			AdvertiseHTTP: s.cfg.Cluster.AdvertiseHTTP,
+			TenantID:      tenant.ID,
+			TenantSlug:    tenant.Slug,
+			TunnelName:    assigned.Name,
+			AgentID:       ack.AgentID,
+			Type:          string(assigned.Type),
+			Domain:        assigned.Domain,
+			PublicAddr:    assigned.PublicAddr,
+			RemotePort:    assigned.RemotePort,
+		})
 		if assigned.Type == protocol.TunnelTCP {
 			s.startTCPListener(ctx, route.Key(), assigned.RemotePort, tenant.ID, assigned.Name)
 		}
@@ -235,15 +303,18 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	case <-sess.CloseChan():
 	}
 
+	// Soft-hold for session resume: keep TCP ports briefly via resume store.
+	_ = s.resume.SoftHold(tenant.ID, ack.AgentID, ack.Tunnels)
 	s.registry.UnregisterAgent(tenant.ID, ack.AgentID)
+	_ = s.cluster.DeleteAgent(tenant.ID, ack.AgentID)
 	s.stopTCPListenersForAgent(tenant.ID, ack.AgentID, ack.Tunnels)
 	s.store.MarkAgentOffline(tenant.ID, ack.AgentID)
-	s.store.Audit(tenant.ID, ack.AgentID, "agent.disconnect", ack.AgentID, "")
+	s.store.Audit(tenant.ID, ack.AgentID, "agent.disconnect", ack.AgentID, "resume_held")
 	s.log.Info("agent offline", "agent_id", ack.AgentID, "tenant", tenant.Slug)
 }
 
 func (s *Server) validateHello(hello protocol.Hello) (*protocol.HelloAck, *store.Tenant, error) {
-	if hello.Version != 0 && hello.Version != protocol.Version {
+	if hello.Version != 0 && hello.Version != protocol.Version && hello.Version != 1 {
 		return nil, nil, fmt.Errorf("unsupported protocol version %d", hello.Version)
 	}
 	if hello.AgentID == "" {
@@ -256,6 +327,38 @@ func (s *Server) validateHello(hello protocol.Hello) (*protocol.HelloAck, *store
 	_, tenant, err := s.store.ResolveAgentToken(hello.Token)
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid token")
+	}
+
+	// Session resume: reuse prior domain/port assignments when possible.
+	if hello.ResumeToken != "" {
+		if st, ok := s.resume.Consume(hello.ResumeToken); ok &&
+			st.TenantID == tenant.ID && st.AgentID == hello.AgentID {
+			tunnels := make([]protocol.AssignedTunnel, 0, len(st.Tunnels))
+			for _, t := range st.Tunnels {
+				if t.Type == protocol.TunnelTCP {
+					port, err := s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, t.RemotePort)
+					if err != nil {
+						port, err = s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, 0)
+						if err != nil {
+							return nil, nil, err
+						}
+					}
+					t.RemotePort = port
+					t.PublicAddr = fmt.Sprintf("%s:%d", s.cfg.PublicHost, port)
+				}
+				tunnels = append(tunnels, t)
+			}
+			ack := &protocol.HelloAck{
+				Version:     protocol.Version,
+				AgentID:     hello.AgentID,
+				TenantID:    tenant.ID,
+				Resumed:     true,
+				Message:     "resumed",
+				Tunnels:     tunnels,
+				ResumeToken: s.resume.Issue(tenant.ID, hello.AgentID, tunnels),
+			}
+			return ack, tenant, nil
+		}
 	}
 
 	names := make([]string, 0, len(hello.Tunnels))
@@ -313,6 +416,7 @@ func (s *Server) validateHello(hello protocol.Hello) (*protocol.HelloAck, *store
 			return nil, nil, fmt.Errorf("unsupported tunnel type %q", t.Type)
 		}
 	}
+	ack.ResumeToken = s.resume.Issue(tenant.ID, hello.AgentID, ack.Tunnels)
 	return ack, tenant, nil
 }
 
@@ -371,9 +475,93 @@ func (s *Server) stopTCPListenersForAgent(tenantID, agentID string, tunnels []pr
 			stop()
 			delete(s.tcpStops, key)
 		}
-		if t.RemotePort > 0 {
-			s.registry.ReleasePort(t.RemotePort)
-		}
+		// Keep port reserved in resume window — do not ReleasePort here.
+		_ = t.RemotePort
 	}
 	_ = agentID
+}
+
+func absPath(dir, p string) string {
+	if p == "" {
+		return ""
+	}
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(dir, p)
+}
+
+func maskKey(k string) string {
+	if len(k) <= 8 {
+		return "***"
+	}
+	return k[:4] + "..." + k[len(k)-4:]
+}
+
+func (s *Server) trackListener(ln net.Listener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listeners = append(s.listeners, ln)
+}
+
+func (s *Server) shutdown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, stop := range s.tcpStops {
+		stop()
+	}
+	for _, ln := range s.listeners {
+		_ = ln.Close()
+	}
+	_ = s.cluster.Close()
+}
+
+func (s *Server) Close() { s.shutdown() }
+
+func (s *Server) heartbeatLoop(ctx context.Context) {
+	t := time.NewTicker(20 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP)
+			for _, route := range s.registry.List() {
+				_ = s.cluster.Put(cluster.TunnelLocation{
+					EdgeID:        s.cfg.EdgeID,
+					AdvertiseHTTP: s.cfg.Cluster.AdvertiseHTTP,
+					TenantID:      route.TenantID,
+					TenantSlug:    route.TenantSlug,
+					TunnelName:    route.TunnelName,
+					AgentID:       route.AgentID,
+					Type:          string(route.Type),
+					Domain:        route.Domain,
+					PublicAddr:    route.PublicAddr,
+					RemotePort:    route.RemotePort,
+				})
+			}
+		}
+	}
+}
+
+func (s *Server) peerURLFor(edgeID string) string {
+	if loc, ok := findPeer(s.cfg.Cluster.Peers, edgeID); ok {
+		return loc
+	}
+	for _, e := range s.cluster.ListEdges() {
+		if e.ID == edgeID {
+			return e.AdvertiseHTTP
+		}
+	}
+	return ""
+}
+
+func findPeer(peers []config.PeerConfig, id string) (string, bool) {
+	for _, p := range peers {
+		if p.ID == id {
+			return p.HTTP, true
+		}
+	}
+	return "", false
 }

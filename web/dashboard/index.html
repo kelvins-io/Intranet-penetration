@@ -87,6 +87,7 @@
       <input id="password" type="password" placeholder="password" value="admin123" />
       <input id="apikey" placeholder="或粘贴 API Key" />
       <button id="btnLogin">登录</button>
+      <button class="secondary hidden" id="btnOIDC">OIDC 登录</button>
       <div id="loginErr" class="muted"></div>
     </div>
   </div>
@@ -132,6 +133,13 @@
         </table>
       </section>
       <section class="card">
+        <h2>集群 Edges</h2>
+        <table>
+          <thead><tr><th>Edge</th><th>Advertise</th><th>Last Seen</th></tr></thead>
+          <tbody id="edges"></tbody>
+        </table>
+      </section>
+      <section class="card">
         <h2>审计日志</h2>
         <table>
           <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>详情</th></tr></thead>
@@ -142,6 +150,14 @@
   </div>
 
   <script>
+    // OIDC callback may land with #api_key=
+    (function pickupOIDC() {
+      const m = location.hash.match(/api_key=([^&]+)/);
+      if (m) {
+        localStorage.setItem('ip_api_key', decodeURIComponent(m[1]));
+        history.replaceState(null, '', location.pathname);
+      }
+    })();
     const state = { key: localStorage.getItem('ip_api_key') || '' };
 
     async function api(path, opts = {}) {
@@ -192,9 +208,21 @@
       document.getElementById('stats').innerHTML = [
         ['在线 Agent', stats.online_agents],
         ['隧道数', stats.tunnels],
-        ['TCP 隧道', stats.tcp_tunnels],
+        ['Edge', stats.edge_id || '-'],
         ['配额 Tunnels', stats.quota.max_tunnels],
       ].map(([l, v]) => `<div class="card"><div class="label">${l}</div><div class="value">${v}</div></div>`).join('');
+
+      try {
+        const cluster = await api('/api/v1/cluster');
+        document.getElementById('edges').innerHTML = (cluster.edges || []).map(e => `
+          <tr>
+            <td><code>${e.id}</code></td>
+            <td class="muted">${e.advertise_http || '-'}</td>
+            <td class="muted">${e.last_seen ? new Date(e.last_seen).toLocaleString() : '-'}</td>
+          </tr>`).join('') || `<tr><td colspan="3" class="muted">当前 ${cluster.edge_id}</td></tr>`;
+      } catch (_) {
+        document.getElementById('edges').innerHTML = '<tr><td colspan="3" class="muted">-</td></tr>';
+      }
 
       const tunnels = await api('/api/v1/tunnels');
       document.getElementById('tunnels').innerHTML = tunnels.map(t => `
@@ -251,6 +279,13 @@
       });
       await refresh();
     };
+
+    document.getElementById('btnOIDC').onclick = () => {
+      location.href = '/api/v1/auth/oidc/login';
+    };
+    fetch('/api/v1/auth/oidc/status').then(r => r.json()).then(d => {
+      if (d.enabled) document.getElementById('btnOIDC').classList.remove('hidden');
+    }).catch(() => {});
 
     if (state.key) {
       refresh().then(() => showApp(true)).catch(() => showApp(false));

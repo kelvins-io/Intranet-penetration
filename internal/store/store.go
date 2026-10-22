@@ -245,6 +245,62 @@ func (s *Store) AuthenticatePassword(email, password string) (*User, *Tenant, er
 	return nil, nil, ErrUnauthorized
 }
 
+// UpsertOIDCUser finds or creates a member user in the first tenant (or given tenant).
+func (s *Store) UpsertOIDCUser(email, displayName, tenantID string) (*User, *Tenant, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return nil, nil, fmt.Errorf("email required")
+	}
+	for i := range s.data.Users {
+		u := &s.data.Users[i]
+		if strings.ToLower(u.Email) == email {
+			if displayName != "" {
+				u.DisplayName = displayName
+			}
+			ten, err := s.tenantByIDLocked(u.TenantID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := s.persistLocked(); err != nil {
+				return nil, nil, err
+			}
+			cp := *u
+			cp.PasswordHash = ""
+			return &cp, ten, nil
+		}
+	}
+	if tenantID == "" {
+		if len(s.data.Tenants) == 0 {
+			return nil, nil, fmt.Errorf("no tenant")
+		}
+		tenantID = s.data.Tenants[0].ID
+	}
+	ten, err := s.tenantByIDLocked(tenantID)
+	if err != nil {
+		return nil, nil, err
+	}
+	u := User{
+		ID:          NewID("usr"),
+		TenantID:    tenantID,
+		Email:       email,
+		DisplayName: displayName,
+		Role:        RoleMember,
+		APIKey:      NewToken(24),
+		CreatedAt:   time.Now().UTC(),
+	}
+	if u.DisplayName == "" {
+		u.DisplayName = email
+	}
+	s.data.Users = append(s.data.Users, u)
+	if err := s.persistLocked(); err != nil {
+		return nil, nil, err
+	}
+	cp := u
+	return &cp, ten, nil
+}
+
 func (s *Store) tenantByIDLocked(id string) (*Tenant, error) {
 	for i := range s.data.Tenants {
 		if s.data.Tenants[i].ID == id {
