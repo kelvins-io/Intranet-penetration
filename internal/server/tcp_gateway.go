@@ -10,6 +10,7 @@ import (
 )
 
 func (s *Server) startTCPListener(ctx context.Context, routeKey string, port int, tenantID, tunnelName string) {
+	s.stopShadowIfAny(tenantID, tunnelName)
 	s.mu.Lock()
 	if stop, ok := s.tcpStops[routeKey]; ok {
 		stop()
@@ -65,7 +66,7 @@ func (s *Server) handleTCPConn(tenantID, tunnelName string, client net.Conn) {
 	}
 	defer release()
 
-	stream, err := s.registry.OpenToAgent(tenantID, tunnelName, remote)
+	stream, err := s.openAgentOrPeer(context.Background(), "tcp", tenantID, tunnelName, remote)
 	if err != nil {
 		s.log.Warn("open agent stream", "tunnel", tunnelName, "err", err)
 		return

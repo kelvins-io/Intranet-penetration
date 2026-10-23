@@ -17,6 +17,8 @@ agent_mtls: "off"
 access_default_deny: false
 resume_ttl: 5m
 probe_interval: 15s
+# 穿透路径探针（可选）：相对 http_gateway，用于真实 SLA
+probe_path: "/default/demo/"
 admin_email: "admin@localhost"
 admin_password: "admin123"
 tls_cert: "server.crt"

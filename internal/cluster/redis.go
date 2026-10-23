@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 
@@ -22,18 +21,11 @@ type RedisRegistry struct {
 }
 
 func NewRedis(redisURL string) (*RedisRegistry, error) {
-	opt, err := redis.ParseURL(redisURL)
+	rdb, err := DialRedis(redisURL)
 	if err != nil {
 		return nil, err
 	}
-	rdb := redis.NewClient(opt)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		_ = rdb.Close()
-		return nil, fmt.Errorf("redis ping: %w", err)
-	}
-	return &RedisRegistry{rdb: rdb}, nil
+	return NewRedisWithClient(rdb), nil
 }
 
 func (r *RedisRegistry) Put(loc TunnelLocation) error {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
+	"github.com/kelvins-io/Intranet-penetration/internal/trace"
 	"github.com/kelvins-io/Intranet-penetration/internal/traffic"
 )
 
@@ -35,10 +36,11 @@ func (s *Server) serveHTTPGateway(ctx context.Context, ln net.Listener) {
 	mux.HandleFunc("/agent/ws", s.handleAgentWS)
 	mux.HandleFunc("/api/v1/regions/discover", s.handleRegionDiscover)
 	mux.HandleFunc("/internal/forward/", s.handleInternalForward)
+	mux.HandleFunc("/internal/stream/", s.handleInternalStream)
 	mux.HandleFunc("/", s.handlePublicHTTP)
 
 	srv := &http.Server{
-		Handler:           mux,
+		Handler:           trace.Middleware(s.log, mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
@@ -53,11 +55,16 @@ func (s *Server) serveHTTPGateway(ctx context.Context, ln net.Listener) {
 }
 
 func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
+	sp, ctx := trace.Start(r.Context(), "http.public")
+	defer sp.End(s.log, nil)
+	r = r.WithContext(ctx)
 	tenantID, name, rest, ok := s.resolveHTTPTarget(r)
 	if !ok {
 		http.Error(w, "tunnel not found; use /{tenant}/{tunnel}/... or Host {tunnel}.{tenant}."+s.cfg.BaseDomain, http.StatusNotFound)
 		return
 	}
+	sp.Attrs["tunnel"] = name
+	sp.Attrs["tenant"] = tenantID
 	if !s.enforceAccess(w, r, tenantID, name, "http.access") {
 		return
 	}
@@ -68,6 +75,7 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	if route, exists := s.registry.Get(tenantID, name); exists && route.Type == protocol.TunnelHTTP {
+		sp.Attrs["edge"] = "local"
 		s.proxyLocalHTTP(w, r, tenantID, name, rest, bw)
 		return
 	}
@@ -77,6 +85,8 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 		if peer == "" {
 			peer = s.peerURLFor(loc.EdgeID)
 		}
+		sp.Attrs["edge"] = loc.EdgeID
+		sp.Attrs["peer"] = peer
 		if err := s.forwardToPeerLoc(w, r, peer, tenantID, name, rest); err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 		}

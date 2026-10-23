@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -23,9 +24,11 @@ var (
 )
 
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	data Snapshot
+	mu           sync.RWMutex
+	path         string
+	data         Snapshot
+	rdb          *redis.Client // optional shared control snapshot (HA)
+	redisUpdated time.Time
 }
 
 func Open(path string) (*Store, error) {
@@ -44,22 +47,21 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) persistLocked() error {
-	if s.path == "" {
-		return nil
+	if s.path != "" {
+		b, err := json.MarshalIndent(s.data, "", "  ")
+		if err != nil {
+			return err
+		}
+		tmp := s.path + ".tmp"
+		if err := os.WriteFile(tmp, b, 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, s.path); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
 	}
-	b, err := json.MarshalIndent(s.data, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return s.persistRedisLocked()
 }
 
 func NewID(prefix string) string {

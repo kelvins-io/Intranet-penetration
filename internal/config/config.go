@@ -78,6 +78,7 @@ type ServerConfig struct {
 	Cluster           ClusterConfig `yaml:"cluster"`
 	OIDC              OIDCConfig    `yaml:"oidc"`
 	ProbeInterval     time.Duration `yaml:"probe_interval"` // synthetic SLA probe; 0 = 15s
+	ProbePath         string        `yaml:"probe_path"`     // optional tunnel path e.g. /default/demo/ for path SLA
 	ReadTimeout       time.Duration `yaml:"read_timeout"`
 	WriteTimeout      time.Duration `yaml:"write_timeout"`
 }

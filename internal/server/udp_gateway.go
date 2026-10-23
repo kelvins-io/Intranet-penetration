@@ -17,6 +17,7 @@ type udpAssoc struct {
 }
 
 func (s *Server) startUDPListener(ctx context.Context, routeKey string, port int, tenantID, tunnelName string) {
+	s.stopShadowIfAny(tenantID, tunnelName)
 	s.mu.Lock()
 	if stop, ok := s.tcpStops[routeKey]; ok {
 		stop()
@@ -114,15 +115,22 @@ func (s *Server) handleUDPAssoc(ctx context.Context, pc *net.UDPConn, tenantID, 
 	}
 	defer release()
 
+	var stream net.Conn
 	route, ok := s.registry.Get(tenantID, tunnelName)
-	if !ok || route.Session == nil || route.Session.IsClosed() {
-		s.log.Warn("udp tunnel offline", "tunnel", tunnelName)
-		return
-	}
-	stream, err := route.Session.OpenUDPStream(tunnelName, remote)
-	if err != nil {
-		s.log.Warn("open udp stream", "tunnel", tunnelName, "err", err)
-		return
+	if ok && route.Session != nil && !route.Session.IsClosed() {
+		var err error
+		stream, err = route.Session.OpenUDPStream(tunnelName, remote)
+		if err != nil {
+			s.log.Warn("open udp stream", "tunnel", tunnelName, "err", err)
+			return
+		}
+	} else {
+		var err error
+		stream, err = s.openAgentOrPeer(ctx, "udp", tenantID, tunnelName, remote)
+		if err != nil {
+			s.log.Warn("udp tunnel offline", "tunnel", tunnelName, "err", err)
+			return
+		}
 	}
 	defer stream.Close()
 

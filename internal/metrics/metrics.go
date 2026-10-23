@@ -20,12 +20,16 @@ type Snapshot struct {
 	BytesOut          uint64    `json:"bytes_out"`
 	E2EStreams        uint64    `json:"e2e_streams"`
 	AgentConnects     uint64    `json:"agent_connects"`
-	ProbeTotal        uint64    `json:"probe_total"`
-	ProbeSuccess      uint64    `json:"probe_success"`
-	ProbeFail         uint64    `json:"probe_fail"`
-	ProbeLatencyMsP50 float64   `json:"probe_latency_ms_p50"`
-	Availability      float64   `json:"availability_pct"`
-	AvailabilitySource string   `json:"availability_source"`
+	ProbeTotal         uint64  `json:"probe_total"`
+	ProbeSuccess       uint64  `json:"probe_success"`
+	ProbeFail          uint64  `json:"probe_fail"`
+	PathProbeTotal     uint64  `json:"path_probe_total"`
+	PathProbeSuccess   uint64  `json:"path_probe_success"`
+	PathProbeFail      uint64  `json:"path_probe_fail"`
+	ProbeLatencyMsP50  float64 `json:"probe_latency_ms_p50"`
+	PathLatencyMsP50   float64 `json:"path_latency_ms_p50"`
+	Availability       float64 `json:"availability_pct"`
+	AvailabilitySource string  `json:"availability_source"`
 }
 
 type Collector struct {
@@ -37,14 +41,20 @@ type Collector struct {
 	bytesOut atomic.Uint64
 	e2e     atomic.Uint64
 	agents  atomic.Uint64
-	probeOK atomic.Uint64
-	probeFail atomic.Uint64
+	probeOK    atomic.Uint64
+	probeFail  atomic.Uint64
+	pathOK     atomic.Uint64
+	pathFail   atomic.Uint64
 
-	mu           sync.Mutex
-	probeLatMs   []float64 // ring of recent latencies
-	probeRing    []bool    // ring of recent success
-	probeIdx     int
-	probeFilled  bool
+	mu          sync.Mutex
+	probeLatMs  []float64
+	probeRing   []bool
+	probeIdx    int
+	probeFilled bool
+	pathLatMs   []float64
+	pathRing    []bool
+	pathIdx     int
+	pathFilled  bool
 }
 
 func New() *Collector {
@@ -52,6 +62,8 @@ func New() *Collector {
 		started:    time.Now().UTC(),
 		probeLatMs: make([]float64, probeWindow),
 		probeRing:  make([]bool, probeWindow),
+		pathLatMs:  make([]float64, probeWindow),
+		pathRing:   make([]bool, probeWindow),
 	}
 }
 
@@ -70,7 +82,7 @@ func (c *Collector) AddBytes(in, out int64) {
 	}
 }
 
-// RecordProbe records a synthetic health probe result for SLA calculation.
+// RecordProbe records a synthetic /healthz probe result for SLA calculation.
 func (c *Collector) RecordProbe(ok bool, latency time.Duration) {
 	if ok {
 		c.probeOK.Add(1)
@@ -87,43 +99,73 @@ func (c *Collector) RecordProbe(ok bool, latency time.Duration) {
 	}
 }
 
+// RecordPathProbe records an HTTP tunnel path probe (closer to user SLA).
+func (c *Collector) RecordPathProbe(ok bool, latency time.Duration) {
+	if ok {
+		c.pathOK.Add(1)
+	} else {
+		c.pathFail.Add(1)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pathRing[c.pathIdx] = ok
+	c.pathLatMs[c.pathIdx] = float64(latency.Milliseconds())
+	c.pathIdx = (c.pathIdx + 1) % probeWindow
+	if c.pathIdx == 0 {
+		c.pathFilled = true
+	}
+}
+
+func ringStats(ring []bool, lat []float64, idx int, filled bool) (n, windowOK int, p50 float64) {
+	n = probeWindow
+	if !filled {
+		n = idx
+	}
+	var latSum float64
+	latN := 0
+	for i := 0; i < n; i++ {
+		if ring[i] {
+			windowOK++
+		}
+		if lat[i] > 0 {
+			latSum += lat[i]
+			latN++
+		}
+	}
+	if latN > 0 {
+		p50 = latSum / float64(latN)
+	}
+	return n, windowOK, p50
+}
+
 func (c *Collector) Snapshot() Snapshot {
 	up := time.Since(c.started)
 	ok := c.probeOK.Load()
 	fail := c.probeFail.Load()
 	total := ok + fail
+	pathOK := c.pathOK.Load()
+	pathFail := c.pathFail.Load()
+	pathTotal := pathOK + pathFail
 
 	c.mu.Lock()
-	n := probeWindow
-	if !c.probeFilled {
-		n = c.probeIdx
-	}
-	windowOK := 0
-	var latSum float64
-	latN := 0
-	for i := 0; i < n; i++ {
-		if c.probeRing[i] {
-			windowOK++
-		}
-		if c.probeLatMs[i] > 0 {
-			latSum += c.probeLatMs[i]
-			latN++
-		}
-	}
+	n, windowOK, p50 := ringStats(c.probeRing, c.probeLatMs, c.probeIdx, c.probeFilled)
+	pn, pathWindowOK, pathP50 := ringStats(c.pathRing, c.pathLatMs, c.pathIdx, c.pathFilled)
 	c.mu.Unlock()
 
 	avail := 100.0
 	source := "uptime_fallback"
-	if n > 0 {
+	if pn > 0 {
+		avail = 100 * float64(pathWindowOK) / float64(pn)
+		source = "path_probe_window"
+	} else if n > 0 {
 		avail = 100 * float64(windowOK) / float64(n)
 		source = "synthetic_probe_window"
+	} else if pathTotal > 0 {
+		avail = 100 * float64(pathOK) / float64(pathTotal)
+		source = "path_probe_lifetime"
 	} else if total > 0 {
 		avail = 100 * float64(ok) / float64(total)
 		source = "synthetic_probe_lifetime"
-	}
-	p50 := 0.0
-	if latN > 0 {
-		p50 = latSum / float64(latN) // mean as cheap p50 proxy for small window
 	}
 
 	return Snapshot{
@@ -139,7 +181,11 @@ func (c *Collector) Snapshot() Snapshot {
 		ProbeTotal:         total,
 		ProbeSuccess:       ok,
 		ProbeFail:          fail,
+		PathProbeTotal:     pathTotal,
+		PathProbeSuccess:   pathOK,
+		PathProbeFail:      pathFail,
 		ProbeLatencyMsP50:  p50,
+		PathLatencyMsP50:   pathP50,
 		Availability:       avail,
 		AvailabilitySource: source,
 	}
@@ -175,6 +221,12 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 	_, _ = fmt.Fprintf(w, "# HELP ip_probe_fail_total Synthetic probe failures\n")
 	_, _ = fmt.Fprintf(w, "# TYPE ip_probe_fail_total counter\n")
 	_, _ = fmt.Fprintf(w, "ip_probe_fail_total %d\n", s.ProbeFail)
+	_, _ = fmt.Fprintf(w, "# HELP ip_path_probe_success_total Tunnel path probe successes\n")
+	_, _ = fmt.Fprintf(w, "# TYPE ip_path_probe_success_total counter\n")
+	_, _ = fmt.Fprintf(w, "ip_path_probe_success_total %d\n", s.PathProbeSuccess)
+	_, _ = fmt.Fprintf(w, "# HELP ip_path_probe_fail_total Tunnel path probe failures\n")
+	_, _ = fmt.Fprintf(w, "# TYPE ip_path_probe_fail_total counter\n")
+	_, _ = fmt.Fprintf(w, "ip_path_probe_fail_total %d\n", s.PathProbeFail)
 	_, _ = fmt.Fprintf(w, "# HELP ip_availability_pct Rolling probe availability percent\n")
 	_, _ = fmt.Fprintf(w, "# TYPE ip_availability_pct gauge\n")
 	_, _ = fmt.Fprintf(w, "ip_availability_pct %g\n", s.Availability)

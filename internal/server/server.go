@@ -26,6 +26,7 @@ import (
 	"github.com/kelvins-io/Intranet-penetration/internal/traffic"
 	"github.com/kelvins-io/Intranet-penetration/internal/tunnel"
 	"github.com/quic-go/quic-go"
+	"github.com/redis/go-redis/v9"
 )
 
 type policyCache struct {
@@ -45,7 +46,7 @@ type Server struct {
 	registry *Registry
 	store    *store.Store // nil for edge-only
 	cluster  cluster.Registry
-	resume   *resume.Store
+	resume   resume.Backend
 	oidc     *authoidc.Provider
 	tlsConf  *tls.Config
 	agentTLS *tls.Config
@@ -77,7 +78,7 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 	s := &Server{
 		cfg:      cfg,
 		registry: NewRegistry(),
-		resume:   resume.New(cfg.ResumeTTL),
+		resume:   resume.New(cfg.ResumeTTL), // replaced with Redis when configured
 		metrics:  metrics.New(),
 		limiter:  traffic.NewLimiter(),
 		log:      log,
@@ -88,6 +89,23 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 	s.revoked.serials = map[string]struct{}{}
 
 	var err error
+	var clus cluster.Registry = cluster.NewMemory()
+	var rdb *redis.Client
+	if cfg.Cluster.RedisURL != "" {
+		rdb, err = cluster.DialRedis(cfg.Cluster.RedisURL)
+		if err != nil {
+			return nil, fmt.Errorf("cluster redis: %w", err)
+		}
+		clus = cluster.NewRedisWithClient(rdb)
+		s.resume = resume.NewRedis(rdb, cfg.ResumeTTL)
+		log.Info("cluster registry", "backend", "redis")
+		log.Info("resume store", "backend", "redis")
+	} else {
+		log.Info("cluster registry", "backend", "memory")
+		log.Info("resume store", "backend", "memory")
+	}
+	s.cluster = clus
+
 	if cfg.IsControl() {
 		storePath := ""
 		if cfg.DataDir != "" {
@@ -96,6 +114,14 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 		st, err := store.Open(storePath)
 		if err != nil {
 			return nil, err
+		}
+		if rdb != nil {
+			st.AttachRedis(rdb)
+			if err := st.HydrateFromRedis(); err != nil {
+				log.Warn("hydrate control store from redis", "err", err)
+			} else {
+				log.Info("control store HA", "backend", "redis+file")
+			}
 		}
 		if err := st.Bootstrap(cfg.AdminEmail, cfg.AdminPassword, cfg.AdminAPIKey, cfg.Token); err != nil {
 			return nil, err
@@ -112,19 +138,6 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 	if cfg.IsEdgeOnly() {
 		s.ctrl = controlclient.New(cfg.ControlURL, cfg.Cluster.Secret)
 	}
-
-	var clus cluster.Registry = cluster.NewMemory()
-	if cfg.Cluster.RedisURL != "" {
-		r, err := cluster.NewRedis(cfg.Cluster.RedisURL)
-		if err != nil {
-			return nil, fmt.Errorf("cluster redis: %w", err)
-		}
-		clus = r
-		log.Info("cluster registry", "backend", "redis")
-	} else {
-		log.Info("cluster registry", "backend", "memory")
-	}
-	s.cluster = clus
 
 	mtlsMode := cfg.AgentMTLS
 	if mtlsMode == "" {
@@ -276,6 +289,7 @@ func (s *Server) serveControlAPI(ctx context.Context, ln net.Listener) {
 		s.metrics.WritePrometheus(w)
 	})
 	mux.HandleFunc("/api/v1/regions/discover", s.handleRegionDiscover)
+	mux.HandleFunc("/internal/stream/", s.handleInternalStream)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -348,6 +362,7 @@ func (s *Server) runEdge(ctx context.Context) error {
 	_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP, s.cfg.Region)
 	go s.heartbeatLoop(ctx)
 	s.startProbeLoop(ctx)
+	s.startShadowSyncLoop(ctx)
 	if s.cfg.IsEdgeOnly() {
 		go s.edgeSyncLoop(ctx)
 	}
