@@ -5,13 +5,32 @@ services:
     ports:
       - "6379:6379"
 
-  server:
+  control:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
     depends_on:
       - redis
+    entrypoint: ["/app/control"]
+    ports:
+      - "8090:8090"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/control:/app/data
+      - ./configs/control.yaml:/app/configs/control.yaml:ro
+    command: ["-config", "/app/configs/control.yaml"]
+
+  edge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - control
+    entrypoint: ["/app/edge"]
     ports:
       - "7700:7700/tcp"
       - "7700:7700/udp"
@@ -20,9 +39,9 @@ services:
     environment:
       TZ: Asia/Shanghai
     volumes:
-      - ./data/server:/app/data
-      - ./configs/server.yaml:/app/configs/server.yaml:ro
-    command: ["-config", "/app/configs/server.yaml"]
+      - ./data/edge:/app/data
+      - ./configs/edge.yaml:/app/configs/edge.yaml:ro
+    command: ["-config", "/app/configs/edge.yaml"]
 
   # Optional demo agent: docker compose --profile with-agent up -d
   agent:
@@ -31,7 +50,7 @@ services:
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
     depends_on:
-      - server
+      - edge
     network_mode: host
     entrypoint: ["/app/agent"]
     volumes:

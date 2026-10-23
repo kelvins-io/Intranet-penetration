@@ -1,0 +1,23 @@
+role: edge
+control_url: "http://control:8090"
+listen: ":7700"
+quic_listen: ":7700"
+http_gateway: ":8088"
+https_gateway: ":8443"
+public_host: "127.0.0.1"
+base_domain: "tunnel.local"
+data_dir: "data"
+edge_id: "edge-1"
+region: "cn-east"
+enable_e2e: true
+agent_mtls: "off"
+access_default_deny: false
+auto_tls: true
+tcp_port_min: 20000
+tcp_port_max: 30000
+resume_ttl: 5m
+
+cluster:
+  redis_url: "redis://redis:6379/0"
+  secret: "cluster-dev-secret"
+  advertise_http: "http://edge:8088"

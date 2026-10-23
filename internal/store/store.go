@@ -795,3 +795,15 @@ func (s *Store) IsAgentCertRevoked(serial string) bool {
 	}
 	return false
 }
+
+func (s *Store) ListRevokedSerials() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []string{}
+	for _, c := range s.data.AgentCerts {
+		if c.Revoked {
+			out = append(out, c.Serial)
+		}
+	}
+	return out
+}

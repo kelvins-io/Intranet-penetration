@@ -1,3 +1,5 @@
+# Optional all-in-one (role=all). Prefer control.yaml + edge.yaml for production.
+role: all
 listen: ":7700"
 quic_listen: ":7700"
 http_gateway: ":8088"
@@ -21,8 +23,6 @@ tcp_port_max: 30000
 regions:
   - name: cn-east
     advertise_http: "http://127.0.0.1:8088"
-  # - name: cn-north
-  #   advertise_http: "http://edge-north.example.com:8088"
 
 cluster:
   redis_url: "redis://redis:6379/0"

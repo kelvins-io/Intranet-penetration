@@ -3,9 +3,16 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	RoleAll     = "all"
+	RoleControl = "control"
+	RoleEdge    = "edge"
 )
 
 type PeerConfig struct {
@@ -36,6 +43,14 @@ type OIDCConfig struct {
 }
 
 type ServerConfig struct {
+	// Role: all | control | edge (empty = all).
+	Role string `yaml:"role"`
+	// APIListen is the control-plane HTTP listen addr (API/Dashboard/internal RPC).
+	// For role=all, empty keeps API mounted on http_gateway (compat).
+	APIListen string `yaml:"api_listen"`
+	// ControlURL is required for role=edge (e.g. http://control:8090).
+	ControlURL string `yaml:"control_url"`
+
 	Listen        string        `yaml:"listen"`
 	QUICListen    string        `yaml:"quic_listen"`
 	HTTPGateway   string        `yaml:"http_gateway"`
@@ -54,15 +69,41 @@ type ServerConfig struct {
 	AutoTLS       bool          `yaml:"auto_tls"`
 	EdgeID        string        `yaml:"edge_id"`
 	Region        string        `yaml:"region"`
-	EnableE2E         bool          `yaml:"enable_e2e"` // backhaul AEAD Edge↔Agent
+	EnableE2E         bool          `yaml:"enable_e2e"`
 	AgentMTLS         string        `yaml:"agent_mtls"` // off | optional | require
 	AccessDefaultDeny bool          `yaml:"access_default_deny"`
 	ResumeTTL         time.Duration `yaml:"resume_ttl"`
-	Regions           []RegionPeer  `yaml:"regions"` // multi-region directory
+	Regions           []RegionPeer  `yaml:"regions"`
 	Cluster           ClusterConfig `yaml:"cluster"`
 	OIDC              OIDCConfig    `yaml:"oidc"`
 	ReadTimeout       time.Duration `yaml:"read_timeout"`
 	WriteTimeout      time.Duration `yaml:"write_timeout"`
+}
+
+func (c *ServerConfig) NormalizedRole() string {
+	r := strings.ToLower(strings.TrimSpace(c.Role))
+	if r == "" {
+		return RoleAll
+	}
+	return r
+}
+
+func (c *ServerConfig) IsControl() bool {
+	r := c.NormalizedRole()
+	return r == RoleControl || r == RoleAll
+}
+
+func (c *ServerConfig) IsEdge() bool {
+	r := c.NormalizedRole()
+	return r == RoleEdge || r == RoleAll
+}
+
+func (c *ServerConfig) IsEdgeOnly() bool {
+	return c.NormalizedRole() == RoleEdge
+}
+
+func (c *ServerConfig) IsControlOnly() bool {
+	return c.NormalizedRole() == RoleControl
 }
 
 type AgentTunnel struct {
@@ -74,12 +115,11 @@ type AgentTunnel struct {
 }
 
 type AgentMTLSConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	CertFile string `yaml:"cert_file"`
-	KeyFile  string `yaml:"key_file"`
-	CAFile   string `yaml:"ca_file"`
-	// InsecureSkipVerify only when CA not provided (dev).
-	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	Enabled            bool   `yaml:"enabled"`
+	CertFile           string `yaml:"cert_file"`
+	KeyFile            string `yaml:"key_file"`
+	CAFile             string `yaml:"ca_file"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 }
 
 type AgentConfig struct {
@@ -98,6 +138,7 @@ type AgentConfig struct {
 
 func LoadServer(path string) (*ServerConfig, error) {
 	cfg := &ServerConfig{
+		Role:          RoleAll,
 		Listen:        ":7700",
 		QUICListen:    ":7700",
 		HTTPGateway:   ":8088",
@@ -116,14 +157,33 @@ func LoadServer(path string) (*ServerConfig, error) {
 		AgentMTLS:         "off",
 		AccessDefaultDeny: false,
 		ResumeTTL:         5 * time.Minute,
-		ReadTimeout:   30 * time.Second,
-		WriteTimeout:  30 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 	}
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
 	}
-	if cfg.Token == "" {
+	role := cfg.NormalizedRole()
+	cfg.Role = role
+	switch role {
+	case RoleAll, RoleControl, RoleEdge:
+	default:
+		return nil, fmt.Errorf("role must be all|control|edge")
+	}
+
+	if role != RoleEdge && cfg.Token == "" {
 		return nil, fmt.Errorf("server token is required (bootstrap agent token)")
+	}
+	if role == RoleEdge {
+		if cfg.ControlURL == "" {
+			return nil, fmt.Errorf("control_url is required for role=edge")
+		}
+		if cfg.Cluster.Secret == "" {
+			return nil, fmt.Errorf("cluster.secret is required for role=edge")
+		}
+	}
+	if role == RoleControl && cfg.APIListen == "" {
+		cfg.APIListen = ":8090"
 	}
 	if cfg.TCPPortMin <= 0 || cfg.TCPPortMax <= cfg.TCPPortMin {
 		return nil, fmt.Errorf("invalid tcp port range")
@@ -145,11 +205,15 @@ func LoadServer(path string) (*ServerConfig, error) {
 	default:
 		return nil, fmt.Errorf("agent_mtls must be off|optional|require")
 	}
-	if cfg.Cluster.AdvertiseHTTP == "" {
+	if cfg.Cluster.AdvertiseHTTP == "" && role != RoleControl {
 		cfg.Cluster.AdvertiseHTTP = "http://127.0.0.1" + normalizeListen(cfg.HTTPGateway)
 	}
 	if cfg.OIDC.RedirectURL == "" && cfg.OIDC.Enabled {
-		cfg.OIDC.RedirectURL = cfg.Cluster.AdvertiseHTTP + "/api/v1/auth/oidc/callback"
+		base := cfg.Cluster.AdvertiseHTTP
+		if cfg.APIListen != "" {
+			base = "http://127.0.0.1" + normalizeListen(cfg.APIListen)
+		}
+		cfg.OIDC.RedirectURL = strings.TrimRight(base, "/") + "/api/v1/auth/oidc/callback"
 	}
 	return cfg, nil
 }

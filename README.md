@@ -1,17 +1,28 @@
 # Intranet Penetration
 
-工业级内网穿透平台。当前进度：**Access Policy + Agent mTLS**（在 P3 之上）。
+工业级内网穿透平台。当前进度：**真正的 Edge / Control 部署拓扑**。
 
 ## 架构
 
 ```
-公网用户 ──► Edge(HTTP/HTTPS/TCP) ── Access Policy ──►
-              │  E2E AEAD（X25519 + ChaCha20-Poly1305）
-              ▼
-Agent ── mTLS ──► Server   （QUIC 优先，TCP 回退；支持 resume）
+公网用户 ──► Edge(:8088/:8443) ── Access Policy ──► 本机 Agent session
+                │ miss
+                ▼
+           Peer Edge (/internal/forward)
+
+Agent ── mTLS? ──► Edge(:7700) ── POST /internal/v1/* ──► Control(:8090)
+                                                      │
+                                                 store.json + CA
+Redis ◄── Edge heartbeat / tunnel location ───────────┘（Control 只读目录）
 ```
 
-## 快速开始（本地）
+| 角色 | 二进制 | 职责 |
+|------|--------|------|
+| **Control** | `cmd/control` | API、Dashboard、OIDC、策略/证书、租户权威、内部 RPC |
+| **Edge** | `cmd/edge` | Agent mux、公网网关、TCP 段、本机会话、Redis 位置 |
+| **all** | `cmd/server` | 本地单体（默认），行为与拆分前一致 |
+
+## 快速开始（本地单体）
 
 ```bash
 go mod tidy
@@ -20,66 +31,58 @@ curl http://127.0.0.1:8088/default/demo/
 open http://127.0.0.1:8088/dashboard/
 ```
 
-## Access Policy
-
-按租户配置允许/拒绝规则，匹配主体、隧道、动作与来源 CIDR。
-
-| 字段 | 说明 |
-|------|------|
-| subjects | `anyone` / `authenticated` / `email:x` / `role:admin` |
-| tunnels | 隧道名或 `*` |
-| actions | `http.access` / `tcp.access` / `*` |
-| effect | `allow` / `deny`（按 priority 降序，首条命中生效） |
-| access_default_deny | 无命中时默认拒绝（server.yaml） |
+## 拆分拓扑（本地）
 
 ```bash
-# 创建策略：仅允许内网网段访问 demo 隧道
-curl -H "Authorization: Bearer $KEY" -X POST http://127.0.0.1:8088/api/v1/policies \
-  -d '{"name":"office","effect":"allow","priority":10,"subjects":["anyone"],"tunnels":["demo"],"actions":["http.access"],"source_cidrs":["10.0.0.0/8"]}'
+# 终端 1
+make run-control
+# 终端 2
+make run-edge
+# 终端 3
+make run-agent
+
+# API / Dashboard 在 Control
+open http://127.0.0.1:8090/dashboard/
+# 公网入口在 Edge
+curl http://127.0.0.1:8088/default/demo/
 ```
 
-## Agent mTLS
-
-Server `agent_mtls`: `off` | `optional` | `require`。证书 CN = `agent_id`，吊销后拒绝握手。
-
-```bash
-# 签发（返回 cert_pem / key_pem / ca_pem）
-curl -H "Authorization: Bearer $KEY" -X POST http://127.0.0.1:8088/api/v1/certs \
-  -d '{"agent_id":"dev-agent","ttl_days":365}'
-
-# Agent 配置 mtls.enabled=true 并指向证书文件后重连
-```
+配置见 [`configs/control.yaml`](configs/control.yaml)、[`configs/edge.yaml`](configs/edge.yaml)。多 Edge 时每个进程使用唯一 `edge_id`，并配置同一 `cluster.secret` + Redis。
 
 ## 私有化部署
 
 ```bash
 chmod +x scripts/private-install.sh
 ./scripts/private-install.sh
+# → redis + control(:8090) + edge(:7700/:8088/:8443)
+
 helm upgrade --install ip deploy/helm/intranet-penetration
 ```
+
+Helm：Control Deployment（PVC）+ Edge StatefulSet（每副本独立 `edge_id`）。需自备 Redis（`config.redisURL`）。
 
 ## 能力一览
 
 | 阶段 | 能力 |
 |------|------|
-| P0–P2 | 隧道、多租户、HTTPS/域名、Dashboard、QUIC/集群/resume/OIDC |
-| P3 | E2E 回程加密、多区域、私有化套件、SLA/合规导出 |
-| **当前** | **Access Policy、Agent mTLS（签发/吊销/CN 校验）** |
+| P0–P3 | 隧道、多租户、HTTPS、QUIC、E2E、多区域、SLA/合规 |
+| Access Policy + mTLS | 访问策略、Agent 证书签发/吊销 |
+| **当前** | **Control / Edge 进程分离、内部 RPC、Compose/Helm 拓扑** |
 
 ## API 摘录
 
 ```bash
-curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8088/api/v1/policies
-curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8088/api/v1/certs
-curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8088/api/v1/certs/ca -o ca.crt
-curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8088/api/v1/sla/report
-curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8088/api/v1/compliance/export -o compliance.json
+# Control
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8090/api/v1/policies
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8090/api/v1/certs
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8090/api/v1/cluster
+
+# Edge 健康检查（无公开管理 API）
+curl http://127.0.0.1:8088/healthz
 ```
 
 ## 路线图
 
-- **P0**：单体 Server、Token、HTTP/TCP、yamux、重连
-- **P1**：多租户、HTTPS/自定义域名、Dashboard、配额与审计
-- **P2**：Edge 集群、QUIC、会话恢复、OIDC
-- **P3**：E2E 回程加密、多区域、私有化套件、SLA/合规导出
-- **当前**：Access Policy + Agent mTLS
+- **P0–P3**：隧道平台 → 多租户 → 集群/QUIC → E2E/私有化
+- **Access Policy + mTLS**
+- **当前**：真正的 Edge / Control 部署拓扑

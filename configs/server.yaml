@@ -1,3 +1,5 @@
+# Local all-in-one (Control+Edge). Split deploy: configs/control.yaml + configs/edge.yaml
+role: all
 listen: ":7700"
 quic_listen: ":7700"
 http_gateway: ":8088"

@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 	"github.com/kelvins-io/Intranet-penetration/internal/authoidc"
 	"github.com/kelvins-io/Intranet-penetration/internal/cluster"
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
+	"github.com/kelvins-io/Intranet-penetration/internal/controlclient"
 	"github.com/kelvins-io/Intranet-penetration/internal/metrics"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
 	"github.com/kelvins-io/Intranet-penetration/internal/resume"
@@ -23,18 +26,31 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+type policyCache struct {
+	mu    sync.RWMutex
+	byTen map[string][]store.AccessPolicy
+	at    time.Time
+}
+
 type Server struct {
-	cfg       *config.ServerConfig
-	registry  *Registry
-	store     *store.Store
-	cluster   cluster.Registry
-	resume    *resume.Store
-	oidc      *authoidc.Provider
-	tlsConf   *tls.Config // public HTTPS / base
-	agentTLS  *tls.Config // agent mux (may require client certs)
-	ca        *tlsutil.CA
-	metrics   *metrics.Collector
-	log       *slog.Logger
+	cfg      *config.ServerConfig
+	registry *Registry
+	store    *store.Store // nil for edge-only
+	cluster  cluster.Registry
+	resume   *resume.Store
+	oidc     *authoidc.Provider
+	tlsConf  *tls.Config
+	agentTLS *tls.Config
+	ca       *tlsutil.CA
+	ctrl     *controlclient.Client // set for edge-only
+	metrics  *metrics.Collector
+	log      *slog.Logger
+	policies policyCache
+	revoked  struct {
+		mu      sync.RWMutex
+		serials map[string]struct{}
+		at      time.Time
+	}
 
 	mu        sync.Mutex
 	tcpStops  map[string]context.CancelFunc
@@ -45,16 +61,44 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	storePath := ""
-	if cfg.DataDir != "" {
-		storePath = filepath.Join(cfg.DataDir, "store.json")
+	role := cfg.NormalizedRole()
+	cfg.Role = role
+
+	s := &Server{
+		cfg:      cfg,
+		registry: NewRegistry(),
+		resume:   resume.New(cfg.ResumeTTL),
+		metrics:  metrics.New(),
+		log:      log,
+		tcpStops: make(map[string]context.CancelFunc),
 	}
-	st, err := store.Open(storePath)
-	if err != nil {
-		return nil, err
+	s.policies.byTen = map[string][]store.AccessPolicy{}
+	s.revoked.serials = map[string]struct{}{}
+
+	var err error
+	if cfg.IsControl() {
+		storePath := ""
+		if cfg.DataDir != "" {
+			storePath = filepath.Join(cfg.DataDir, "store.json")
+		}
+		st, err := store.Open(storePath)
+		if err != nil {
+			return nil, err
+		}
+		if err := st.Bootstrap(cfg.AdminEmail, cfg.AdminPassword, cfg.AdminAPIKey, cfg.Token); err != nil {
+			return nil, err
+		}
+		s.store = st
+
+		oidcProv, err := authoidc.New(cfg.OIDC)
+		if err != nil {
+			return nil, fmt.Errorf("oidc: %w", err)
+		}
+		s.oidc = oidcProv
 	}
-	if err := st.Bootstrap(cfg.AdminEmail, cfg.AdminPassword, cfg.AdminAPIKey, cfg.Token); err != nil {
-		return nil, err
+
+	if cfg.IsEdgeOnly() {
+		s.ctrl = controlclient.New(cfg.ControlURL, cfg.Cluster.Secret)
 	}
 
 	var clus cluster.Registry = cluster.NewMemory()
@@ -68,11 +112,7 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 	} else {
 		log.Info("cluster registry", "backend", "memory")
 	}
-
-	oidcProv, err := authoidc.New(cfg.OIDC)
-	if err != nil {
-		return nil, fmt.Errorf("oidc: %w", err)
-	}
+	s.cluster = clus
 
 	mtlsMode := cfg.AgentMTLS
 	if mtlsMode == "" {
@@ -80,10 +120,15 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 	}
 	cfg.AgentMTLS = mtlsMode
 
-	needTLS := cfg.AutoTLS || cfg.QUICListen != "" || cfg.HTTPSGateway != "" || mtlsMode != "off"
-	var tlsConf *tls.Config
-	if needTLS {
-		tlsConf, err = tlsutil.LoadOrGenerate(
+	needTLS := false
+	if cfg.IsEdge() {
+		needTLS = cfg.AutoTLS || cfg.QUICListen != "" || cfg.HTTPSGateway != "" || mtlsMode != "off"
+	}
+	if cfg.IsControlOnly() && (cfg.AutoTLS || strings.HasPrefix(cfg.APIListen, "https")) {
+		needTLS = cfg.AutoTLS
+	}
+	if needTLS || (cfg.IsControl() && mtlsMode != "off" && !cfg.IsEdgeOnly()) {
+		s.tlsConf, err = tlsutil.LoadOrGenerate(
 			absPath(cfg.DataDir, cfg.TLSCert),
 			absPath(cfg.DataDir, cfg.TLSKey),
 			cfg.AutoTLS || cfg.TLSCert == "",
@@ -94,34 +139,137 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 		}
 	}
 
-	var ca *tlsutil.CA
-	var agentTLS *tls.Config
-	if mtlsMode != "off" {
-		ca, err = tlsutil.LoadOrCreateCA(cfg.DataDir)
+	if cfg.IsControl() {
+		s.ca, err = tlsutil.LoadOrCreateCA(cfg.DataDir)
 		if err != nil {
 			return nil, fmt.Errorf("ca: %w", err)
 		}
-		agentTLS = tlsutil.ServerMTLSConfig(tlsConf, ca, mtlsMode)
-		log.Info("agent mTLS", "mode", mtlsMode)
 	}
 
-	return &Server{
-		cfg:      cfg,
-		registry: NewRegistry(),
-		store:    st,
-		cluster:  clus,
-		resume:   resume.New(cfg.ResumeTTL),
-		oidc:     oidcProv,
-		tlsConf:  tlsConf,
-		agentTLS: agentTLS,
-		ca:       ca,
-		metrics:  metrics.New(),
-		log:      log,
-		tcpStops: make(map[string]context.CancelFunc),
-	}, nil
+	if mtlsMode != "off" && cfg.IsEdge() {
+		if cfg.IsEdgeOnly() {
+			if err := s.loadEdgeMTLSFromControl(); err != nil {
+				return nil, fmt.Errorf("edge mtls: %w", err)
+			}
+		} else if s.ca != nil {
+			s.agentTLS = tlsutil.ServerMTLSConfig(s.tlsConf, s.ca, mtlsMode)
+		}
+		log.Info("agent mTLS", "mode", mtlsMode, "role", role)
+	}
+
+	return s, nil
+}
+
+func (s *Server) loadEdgeMTLSFromControl() error {
+	pemBytes, err := s.ctrl.CAPEM()
+	if err != nil {
+		return err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return fmt.Errorf("invalid ca from control")
+	}
+	base := s.tlsConf
+	if base == nil {
+		base, err = tlsutil.LoadOrGenerate(
+			absPath(s.cfg.DataDir, s.cfg.TLSCert),
+			absPath(s.cfg.DataDir, s.cfg.TLSKey),
+			true,
+			[]string{s.cfg.PublicHost, "localhost"},
+		)
+		if err != nil {
+			return err
+		}
+		s.tlsConf = base
+	}
+	cfg := base.Clone()
+	cfg.ClientCAs = pool
+	switch s.cfg.AgentMTLS {
+	case "require":
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	default:
+		cfg.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+	if len(cfg.NextProtos) == 0 {
+		cfg.NextProtos = []string{"ip-tunnel"}
+	}
+	s.agentTLS = cfg
+	_ = s.refreshRevoked(true)
+	return nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	role := s.cfg.NormalizedRole()
+	go func() {
+		<-ctx.Done()
+		s.shutdown()
+	}()
+
+	if s.cfg.IsControl() {
+		if err := s.startControlHTTP(ctx); err != nil {
+			return err
+		}
+	}
+
+	if !s.cfg.IsEdge() {
+		s.log.Info("control plane ready",
+			"role", role,
+			"api_listen", s.cfg.APIListen,
+			"edge_id", s.cfg.EdgeID,
+			"region", s.cfg.Region,
+			"oidc", s.oidc != nil,
+			"admin_api_key_hint", maskKey(s.store.AdminAPIKey()),
+		)
+		<-ctx.Done()
+		return nil
+	}
+
+	return s.runEdge(ctx)
+}
+
+func (s *Server) startControlHTTP(ctx context.Context) error {
+	apiAddr := s.cfg.APIListen
+	mountOnGateway := apiAddr == "" && s.cfg.NormalizedRole() == config.RoleAll
+
+	if mountOnGateway {
+		// API will be mounted on gateway mux in serveHTTPGateway.
+		return nil
+	}
+	if apiAddr == "" {
+		apiAddr = ":8090"
+	}
+	ln, err := net.Listen("tcp", apiAddr)
+	if err != nil {
+		return fmt.Errorf("listen api: %w", err)
+	}
+	s.trackListener(ln)
+	s.log.Info("control api listening", "addr", ln.Addr().String())
+	go s.serveControlAPI(ctx, ln)
+	return nil
+}
+
+func (s *Server) serveControlAPI(ctx context.Context, ln net.Listener) {
+	mux := http.NewServeMux()
+	s.mountAPI(mux)
+	s.mountDashboard(mux)
+	s.mountInternalAPI(mux)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		s.log.Debug("control api stopped", "err", err)
+	}
+}
+
+func (s *Server) runEdge(ctx context.Context) error {
 	rawAgentLn, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen agent tcp: %w", err)
@@ -180,22 +328,19 @@ func (s *Server) Run(ctx context.Context) error {
 
 	_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP, s.cfg.Region)
 	go s.heartbeatLoop(ctx)
+	if s.cfg.IsEdgeOnly() {
+		go s.edgeSyncLoop(ctx)
+	}
 
-	s.log.Info("control plane ready",
+	s.log.Info("edge plane ready",
+		"role", s.cfg.Role,
 		"edge_id", s.cfg.EdgeID,
 		"region", s.cfg.Region,
 		"e2e", s.cfg.EnableE2E,
 		"agent_mtls", s.cfg.AgentMTLS,
 		"access_default_deny", s.cfg.AccessDefaultDeny,
-		"dashboard", fmt.Sprintf("http://%s/dashboard/", s.httpAdvertiseHost()),
-		"oidc", s.oidc != nil,
-		"admin_api_key_hint", maskKey(s.store.AdminAPIKey()),
+		"control_url", s.cfg.ControlURL,
 	)
-
-	go func() {
-		<-ctx.Done()
-		s.shutdown()
-	}()
 
 	for {
 		conn, err := agentLn.Accept()
@@ -208,6 +353,20 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}
 		go s.handleAgentTCP(ctx, conn)
+	}
+}
+
+func (s *Server) edgeSyncLoop(ctx context.Context) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = s.refreshRevoked(false)
+			s.invalidatePolicyCache()
+		}
 	}
 }
 
@@ -244,7 +403,7 @@ func (s *Server) handleAgentTCP(ctx context.Context, conn net.Conn) {
 		}
 		if st := tc.ConnectionState(); len(st.PeerCertificates) > 0 {
 			serial := st.PeerCertificates[0].SerialNumber.Text(16)
-			if s.store.IsAgentCertRevoked(serial) {
+			if s.isCertRevoked(serial) {
 				s.log.Warn("agent cert revoked", "serial", serial, "remote", remote)
 				_ = conn.Close()
 				return
@@ -271,7 +430,7 @@ func (s *Server) handleAgentQUIC(ctx context.Context, conn *quic.Conn) {
 	if st := conn.ConnectionState().TLS; len(st.PeerCertificates) > 0 {
 		peerCN = st.PeerCertificates[0].Subject.CommonName
 		serial := st.PeerCertificates[0].SerialNumber.Text(16)
-		if s.store.IsAgentCertRevoked(serial) {
+		if s.isCertRevoked(serial) {
 			s.log.Warn("agent cert revoked", "serial", serial, "remote", remote)
 			_ = conn.CloseWithError(1, "revoked")
 			return
@@ -332,7 +491,7 @@ func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, re
 		"e2e", ack.E2E,
 		"region", ack.Region,
 	)
-	s.store.Audit(tenant.ID, ack.AgentID, "agent.connect", ack.AgentID, remote+" "+ack.Transport+" e2e="+fmt.Sprint(ack.E2E))
+	s.reportAgentOnline(tenant, ack, *hello, remote)
 
 	for _, assigned := range ack.Tunnels {
 		route := &Route{
@@ -356,17 +515,6 @@ func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, re
 			s.log.Error("register tunnel", "tunnel", assigned.Name, "err", err)
 			continue
 		}
-		_, _ = s.store.UpsertTunnel(store.TunnelRecord{
-			TenantID:   tenant.ID,
-			Name:       assigned.Name,
-			Type:       string(assigned.Type),
-			LocalHint:  route.LocalHint,
-			Domain:     assigned.Domain,
-			PublicAddr: assigned.PublicAddr,
-			RemotePort: assigned.RemotePort,
-			AgentID:    ack.AgentID,
-			Online:     true,
-		})
 		_ = s.cluster.Put(cluster.TunnelLocation{
 			EdgeID:        s.cfg.EdgeID,
 			AdvertiseHTTP: s.cfg.Cluster.AdvertiseHTTP,
@@ -390,7 +538,6 @@ func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, re
 			"public", assigned.PublicAddr,
 			"domain", assigned.Domain,
 		)
-		s.store.Audit(tenant.ID, ack.AgentID, "tunnel.online", assigned.Name, assigned.PublicAddr)
 	}
 
 	select {
@@ -398,17 +545,147 @@ func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, re
 	case <-sess.CloseChan():
 	}
 
-	// Soft-hold for session resume: keep TCP ports briefly via resume store.
 	_ = s.resume.SoftHold(tenant.ID, ack.AgentID, ack.Tunnels)
 	s.registry.UnregisterAgent(tenant.ID, ack.AgentID)
 	_ = s.cluster.DeleteAgent(tenant.ID, ack.AgentID)
 	s.stopTCPListenersForAgent(tenant.ID, ack.AgentID, ack.Tunnels)
-	s.store.MarkAgentOffline(tenant.ID, ack.AgentID)
-	s.store.Audit(tenant.ID, ack.AgentID, "agent.disconnect", ack.AgentID, "resume_held")
+	s.reportAgentOffline(tenant.ID, ack.AgentID)
 	s.log.Info("agent offline", "agent_id", ack.AgentID, "tenant", tenant.Slug)
 }
 
+func (s *Server) reportAgentOnline(tenant *store.Tenant, ack *protocol.HelloAck, hello protocol.Hello, remote string) {
+	hints := map[string]string{}
+	for _, t := range hello.Tunnels {
+		hints[t.Name] = t.LocalAddr
+	}
+	if s.cfg.IsEdgeOnly() && s.ctrl != nil {
+		_ = s.ctrl.AgentOnline(controlclient.OnlineRequest{
+			TenantID: tenant.ID,
+			AgentID:  ack.AgentID,
+			Remote:   remote + " " + ack.Transport + " e2e=" + fmt.Sprint(ack.E2E),
+			Tunnels:  ack.Tunnels,
+			Hints:    hints,
+		})
+		return
+	}
+	if s.store == nil {
+		return
+	}
+	s.store.Audit(tenant.ID, ack.AgentID, "agent.connect", ack.AgentID, remote+" "+ack.Transport+" e2e="+fmt.Sprint(ack.E2E))
+	for _, assigned := range ack.Tunnels {
+		_, _ = s.store.UpsertTunnel(store.TunnelRecord{
+			TenantID:   tenant.ID,
+			Name:       assigned.Name,
+			Type:       string(assigned.Type),
+			LocalHint:  hints[assigned.Name],
+			Domain:     assigned.Domain,
+			PublicAddr: assigned.PublicAddr,
+			RemotePort: assigned.RemotePort,
+			AgentID:    ack.AgentID,
+			Online:     true,
+		})
+		s.store.Audit(tenant.ID, ack.AgentID, "tunnel.online", assigned.Name, assigned.PublicAddr)
+	}
+}
+
+func (s *Server) reportAgentOffline(tenantID, agentID string) {
+	if s.cfg.IsEdgeOnly() && s.ctrl != nil {
+		_ = s.ctrl.AgentOffline(controlclient.OfflineRequest{TenantID: tenantID, AgentID: agentID})
+		return
+	}
+	if s.store == nil {
+		return
+	}
+	s.store.MarkAgentOffline(tenantID, agentID)
+	s.store.Audit(tenantID, agentID, "agent.disconnect", agentID, "resume_held")
+}
+
 func (s *Server) validateHello(hello protocol.Hello) (*protocol.HelloAck, *store.Tenant, error) {
+	// Local resume always handled on Edge.
+	if hello.ResumeToken != "" {
+		if tenant, ack, ok := s.tryResume(hello); ok {
+			return ack, tenant, nil
+		}
+	}
+
+	if s.cfg.IsEdgeOnly() {
+		return s.validateHelloRemote(hello)
+	}
+	return s.validateHelloLocal(hello)
+}
+
+func (s *Server) tryResume(hello protocol.Hello) (*store.Tenant, *protocol.HelloAck, bool) {
+	st, ok := s.resume.Consume(hello.ResumeToken)
+	if !ok || st.AgentID != hello.AgentID {
+		return nil, nil, false
+	}
+	var tenant *store.Tenant
+	if s.store != nil {
+		t, err := s.store.GetTenant(st.TenantID)
+		if err != nil {
+			return nil, nil, false
+		}
+		tenant = t
+	} else {
+		tenant = &store.Tenant{ID: st.TenantID, Slug: "remote"}
+	}
+	tunnels := make([]protocol.AssignedTunnel, 0, len(st.Tunnels))
+	for _, t := range st.Tunnels {
+		if t.Type == protocol.TunnelTCP {
+			port, err := s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, t.RemotePort)
+			if err != nil {
+				port, err = s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, 0)
+				if err != nil {
+					return nil, nil, false
+				}
+			}
+			t.RemotePort = port
+			t.PublicAddr = fmt.Sprintf("%s:%d", s.cfg.PublicHost, port)
+		}
+		tunnels = append(tunnels, t)
+	}
+	ack := &protocol.HelloAck{
+		Version:     protocol.Version,
+		AgentID:     hello.AgentID,
+		TenantID:    st.TenantID,
+		Resumed:     true,
+		Message:     "resumed",
+		Tunnels:     tunnels,
+		ResumeToken: s.resume.Issue(st.TenantID, hello.AgentID, tunnels),
+	}
+	return tenant, ack, true
+}
+
+func (s *Server) validateHelloRemote(hello protocol.Hello) (*protocol.HelloAck, *store.Tenant, error) {
+	resp, err := s.ctrl.AgentHello(controlclient.HelloRequest{
+		Hello:      hello,
+		PublicHost: s.cfg.PublicHost,
+		BaseDomain: s.cfg.BaseDomain,
+		EdgeID:     s.cfg.EdgeID,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	ack := resp.Ack
+	tenant := resp.Tenant
+	// Allocate TCP ports locally.
+	for i := range ack.Tunnels {
+		t := &ack.Tunnels[i]
+		if t.Type != protocol.TunnelTCP {
+			continue
+		}
+		port, err := s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, t.RemotePort)
+		if err != nil {
+			return nil, nil, err
+		}
+		t.RemotePort = port
+		t.PublicAddr = fmt.Sprintf("%s:%d", s.cfg.PublicHost, port)
+	}
+	ack.ResumeToken = s.resume.Issue(tenant.ID, hello.AgentID, ack.Tunnels)
+	return &ack, &tenant, nil
+}
+
+func (s *Server) validateHelloLocal(hello protocol.Hello) (*protocol.HelloAck, *store.Tenant, error) {
 	if hello.Version != 0 && hello.Version != protocol.Version && hello.Version != 1 {
 		return nil, nil, fmt.Errorf("unsupported protocol version %d", hello.Version)
 	}
@@ -422,38 +699,6 @@ func (s *Server) validateHello(hello protocol.Hello) (*protocol.HelloAck, *store
 	_, tenant, err := s.store.ResolveAgentToken(hello.Token)
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid token")
-	}
-
-	// Session resume: reuse prior domain/port assignments when possible.
-	if hello.ResumeToken != "" {
-		if st, ok := s.resume.Consume(hello.ResumeToken); ok &&
-			st.TenantID == tenant.ID && st.AgentID == hello.AgentID {
-			tunnels := make([]protocol.AssignedTunnel, 0, len(st.Tunnels))
-			for _, t := range st.Tunnels {
-				if t.Type == protocol.TunnelTCP {
-					port, err := s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, t.RemotePort)
-					if err != nil {
-						port, err = s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, 0)
-						if err != nil {
-							return nil, nil, err
-						}
-					}
-					t.RemotePort = port
-					t.PublicAddr = fmt.Sprintf("%s:%d", s.cfg.PublicHost, port)
-				}
-				tunnels = append(tunnels, t)
-			}
-			ack := &protocol.HelloAck{
-				Version:     protocol.Version,
-				AgentID:     hello.AgentID,
-				TenantID:    tenant.ID,
-				Resumed:     true,
-				Message:     "resumed",
-				Tunnels:     tunnels,
-				ResumeToken: s.resume.Issue(tenant.ID, hello.AgentID, tunnels),
-			}
-			return ack, tenant, nil
-		}
 	}
 
 	names := make([]string, 0, len(hello.Tunnels))
@@ -516,26 +761,7 @@ func (s *Server) validateHello(hello protocol.Hello) (*protocol.HelloAck, *store
 }
 
 func (s *Server) publicHTTPURL(slug, name, domain string) string {
-	host := s.httpAdvertiseHost()
-	pathURL := fmt.Sprintf("http://%s/%s/%s/", host, slug, name)
-	if domain != "" {
-		_, port, err := net.SplitHostPort(host)
-		if err != nil {
-			port = ""
-		}
-		if s.cfg.HTTPSGateway != "" {
-			hp := domain
-			if p := httpsPort(s.cfg.HTTPSGateway); p != "" && p != "443" {
-				hp = net.JoinHostPort(domain, p)
-			}
-			return fmt.Sprintf("https://%s/ (also %s)", hp, pathURL)
-		}
-		if port != "" && port != "80" {
-			return fmt.Sprintf("http://%s/ (also %s)", net.JoinHostPort(domain, port), pathURL)
-		}
-		return fmt.Sprintf("http://%s/ (also %s)", domain, pathURL)
-	}
-	return pathURL
+	return s.publicHTTPURLWith(s.cfg.PublicHost, slug, name, domain)
 }
 
 func httpsPort(addr string) string {
@@ -570,7 +796,6 @@ func (s *Server) stopTCPListenersForAgent(tenantID, agentID string, tunnels []pr
 			stop()
 			delete(s.tcpStops, key)
 		}
-		// Keep port reserved in resume window — do not ReleasePort here.
 		_ = t.RemotePort
 	}
 	_ = agentID
@@ -660,4 +885,88 @@ func findPeer(peers []config.PeerConfig, id string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (s *Server) isCertRevoked(serial string) bool {
+	if s.store != nil {
+		return s.store.IsAgentCertRevoked(serial)
+	}
+	_ = s.refreshRevoked(false)
+	s.revoked.mu.RLock()
+	defer s.revoked.mu.RUnlock()
+	_, ok := s.revoked.serials[serial]
+	return ok
+}
+
+func (s *Server) refreshRevoked(force bool) error {
+	if s.ctrl == nil {
+		return nil
+	}
+	s.revoked.mu.RLock()
+	fresh := time.Since(s.revoked.at) < 30*time.Second
+	s.revoked.mu.RUnlock()
+	if fresh && !force {
+		return nil
+	}
+	serials, err := s.ctrl.RevokedSerials()
+	if err != nil {
+		return err
+	}
+	m := make(map[string]struct{}, len(serials))
+	for _, ser := range serials {
+		m[ser] = struct{}{}
+	}
+	s.revoked.mu.Lock()
+	s.revoked.serials = m
+	s.revoked.at = time.Now()
+	s.revoked.mu.Unlock()
+	return nil
+}
+
+func (s *Server) listPolicies(tenantID string) []store.AccessPolicy {
+	if s.store != nil {
+		return s.store.ListPolicies(tenantID)
+	}
+	s.policies.mu.RLock()
+	if time.Since(s.policies.at) < 15*time.Second {
+		if p, ok := s.policies.byTen[tenantID]; ok {
+			s.policies.mu.RUnlock()
+			return p
+		}
+	}
+	s.policies.mu.RUnlock()
+	if s.ctrl == nil {
+		return nil
+	}
+	p, err := s.ctrl.ListPolicies(tenantID)
+	if err != nil {
+		s.log.Debug("policy fetch", "err", err)
+		s.policies.mu.RLock()
+		defer s.policies.mu.RUnlock()
+		return s.policies.byTen[tenantID]
+	}
+	s.policies.mu.Lock()
+	s.policies.byTen[tenantID] = p
+	s.policies.at = time.Now()
+	s.policies.mu.Unlock()
+	return p
+}
+
+func (s *Server) invalidatePolicyCache() {
+	s.policies.mu.Lock()
+	s.policies.byTen = map[string][]store.AccessPolicy{}
+	s.policies.at = time.Time{}
+	s.policies.mu.Unlock()
+}
+
+func (s *Server) auditEvent(tenantID, actor, action, target, detail string) {
+	if s.store != nil {
+		s.store.Audit(tenantID, actor, action, target, detail)
+		return
+	}
+	if s.ctrl != nil {
+		_ = s.ctrl.Audit(controlclient.AuditRequest{
+			TenantID: tenantID, Actor: actor, Action: action, Target: target, Detail: detail,
+		})
+	}
 }

@@ -1,35 +1,31 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Release.Name }}-server
+  name: {{ .Release.Name }}-control
   labels:
     app: intranet-penetration
+    component: control
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.control.replicas }}
   selector:
     matchLabels:
       app: intranet-penetration
+      component: control
   template:
     metadata:
       labels:
         app: intranet-penetration
+        component: control
     spec:
       containers:
-        - name: server
+        - name: control
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["-config", "/config/server.yaml"]
+          command: ["/app/control"]
+          args: ["-config", "/config/control.yaml"]
           ports:
-            - name: agent-tcp
-              containerPort: 7700
-              protocol: TCP
-            - name: agent-udp
-              containerPort: 7700
-              protocol: UDP
-            - name: http
-              containerPort: 8088
-            - name: https
-              containerPort: 8443
+            - name: api
+              containerPort: {{ .Values.control.apiPort }}
           volumeMounts:
             - name: config
               mountPath: /config
@@ -37,9 +33,100 @@ spec:
               mountPath: /app/data
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 3
+            periodSeconds: 10
       volumes:
         - name: config
           configMap:
-            name: {{ .Release.Name }}-config
+            name: {{ .Release.Name }}-control-config
+        - name: data
+          {{- if .Values.control.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-control-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.control.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-control-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.control.persistence.size }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-edge
+  labels:
+    app: intranet-penetration
+    component: edge
+spec:
+  serviceName: {{ .Release.Name }}-edge
+  replicas: {{ .Values.edge.replicas }}
+  selector:
+    matchLabels:
+      app: intranet-penetration
+      component: edge
+  template:
+    metadata:
+      labels:
+        app: intranet-penetration
+        component: edge
+    spec:
+      containers:
+        - name: edge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ORDINAL="${HOSTNAME##*-}"
+              sed "s/edge-placeholder/edge-${ORDINAL}/" /config/edge.yaml > /tmp/edge.yaml
+              ADVERTISE="http://${POD_IP}:{{ .Values.edge.httpPort }}"
+              sed -i "s|advertise_http:.*|advertise_http: \"${ADVERTISE}\"|" /tmp/edge.yaml
+              exec /app/edge -config /tmp/edge.yaml
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: agent-tcp
+              containerPort: {{ .Values.edge.tcpPort }}
+              protocol: TCP
+            - name: agent-udp
+              containerPort: {{ .Values.edge.udpPort }}
+              protocol: UDP
+            - name: http
+              containerPort: {{ .Values.edge.httpPort }}
+            - name: https
+              containerPort: {{ .Values.edge.httpsPort }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: data
+              mountPath: /app/data
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-edge-config
         - name: data
           emptyDir: {}

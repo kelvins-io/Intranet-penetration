@@ -1,0 +1,25 @@
+role: edge
+control_url: "http://127.0.0.1:8090"
+listen: ":7700"
+quic_listen: ":7700"
+http_gateway: ":8088"
+https_gateway: ":8443"
+# token unused on edge (authority lives on control)
+token: "unused"
+public_host: "127.0.0.1"
+base_domain: "tunnel.local"
+data_dir: "data/edge"
+edge_id: "edge-1"
+region: "local"
+enable_e2e: true
+agent_mtls: "off"
+access_default_deny: false
+auto_tls: true
+tcp_port_min: 20000
+tcp_port_max: 30000
+resume_ttl: 5m
+
+cluster:
+  secret: "cluster-dev-secret"
+  advertise_http: "http://127.0.0.1:8088"
+  # redis_url: "redis://127.0.0.1:6379/0"

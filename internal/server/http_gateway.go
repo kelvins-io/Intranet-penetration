@@ -10,13 +10,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kelvins-io/Intranet-penetration/internal/config"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
 )
 
 func (s *Server) serveHTTPGateway(ctx context.Context, ln net.Listener) {
 	mux := http.NewServeMux()
-	s.mountAPI(mux)
-	s.mountDashboard(mux)
+	// role=all with empty api_listen: keep API on gateway for local demo compat.
+	if s.cfg.NormalizedRole() == config.RoleAll && s.cfg.APIListen == "" {
+		s.mountAPI(mux)
+		s.mountDashboard(mux)
+		s.mountInternalAPI(mux)
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -49,13 +54,11 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Local agent session?
 	if route, exists := s.registry.Get(tenantID, name); exists && route.Type == protocol.TunnelHTTP {
 		s.proxyLocalHTTP(w, r, tenantID, name, rest)
 		return
 	}
 
-	// Cluster: forward to owning edge
 	if loc, found := s.cluster.Get(tenantID, name); found && loc.EdgeID != s.cfg.EdgeID {
 		peer := loc.AdvertiseHTTP
 		if peer == "" {
@@ -81,7 +84,7 @@ func (s *Server) proxyLocalHTTP(w http.ResponseWriter, r *http.Request, tenantID
 		s.metrics.IncE2E()
 	}
 
-	s.store.Audit(tenantID, "public", "http.access", name, r.Method+" "+r.URL.Path+" from "+r.RemoteAddr)
+	s.auditEvent(tenantID, "public", "http.access", name, r.Method+" "+r.URL.Path+" from "+r.RemoteAddr)
 
 	outReq := r.Clone(r.Context())
 	outReq.URL = &url.URL{
@@ -151,7 +154,6 @@ func (s *Server) handleInternalForward(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	// /internal/forward/{tenantID}/{tunnel}/...
 	path := strings.TrimPrefix(r.URL.Path, "/internal/forward/")
 	parts := strings.SplitN(path, "/", 3)
 	if len(parts) < 2 {
@@ -179,8 +181,14 @@ func (s *Server) resolveHTTPTarget(r *http.Request) (tenantID, name, rest string
 	if loc, found := s.cluster.GetByDomain(host); found {
 		return loc.TenantID, loc.TunnelName, ensurePath(r.URL.Path), true
 	}
-	if rec, err := s.store.FindTunnelByDomain(host); err == nil {
-		return rec.TenantID, rec.Name, ensurePath(r.URL.Path), true
+	if s.store != nil {
+		if rec, err := s.store.FindTunnelByDomain(host); err == nil {
+			return rec.TenantID, rec.Name, ensurePath(r.URL.Path), true
+		}
+	} else if s.ctrl != nil {
+		if res, err := s.ctrl.ResolveDomain(host); err == nil {
+			return res.TenantID, res.TunnelName, ensurePath(r.URL.Path), true
+		}
 	}
 
 	base := strings.ToLower(s.cfg.BaseDomain)
@@ -189,8 +197,8 @@ func (s *Server) resolveHTTPTarget(r *http.Request) (tenantID, name, rest string
 		parts := strings.Split(prefix, ".")
 		if len(parts) == 2 {
 			tunName, slug := parts[0], parts[1]
-			if ten, err := s.store.GetTenantBySlug(slug); err == nil {
-				return ten.ID, tunName, ensurePath(r.URL.Path), true
+			if tid, ok := s.resolveTenantSlug(slug); ok {
+				return tid, tunName, ensurePath(r.URL.Path), true
 			}
 		}
 	}
@@ -207,15 +215,33 @@ func (s *Server) resolveHTTPTarget(r *http.Request) (tenantID, name, rest string
 	if slug == "healthz" || slug == "api" || slug == "dashboard" || slug == "internal" {
 		return "", "", "", false
 	}
-	ten, err := s.store.GetTenantBySlug(slug)
-	if err != nil {
+	tid, ok := s.resolveTenantSlug(slug)
+	if !ok {
 		return "", "", "", false
 	}
 	rest = "/"
 	if len(parts) == 3 {
 		rest = "/" + parts[2]
 	}
-	return ten.ID, tunName, rest, true
+	return tid, tunName, rest, true
+}
+
+func (s *Server) resolveTenantSlug(slug string) (string, bool) {
+	if s.store != nil {
+		ten, err := s.store.GetTenantBySlug(slug)
+		if err != nil {
+			return "", false
+		}
+		return ten.ID, true
+	}
+	if s.ctrl != nil {
+		res, err := s.ctrl.ResolveSlug(slug, "_")
+		if err != nil {
+			return "", false
+		}
+		return res.TenantID, true
+	}
+	return "", false
 }
 
 func stripHostPort(host string) string {

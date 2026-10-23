@@ -1,0 +1,24 @@
+role: control
+api_listen: ":8090"
+token: "dev-token-change-me"
+public_host: "127.0.0.1"
+base_domain: "tunnel.local"
+data_dir: "data"
+region: "cn-east"
+enable_e2e: true
+agent_mtls: "off"
+access_default_deny: false
+admin_email: "admin@localhost"
+admin_password: "admin123"
+auto_tls: true
+
+regions:
+  - name: cn-east
+    advertise_http: "http://edge:8088"
+
+cluster:
+  redis_url: "redis://redis:6379/0"
+  secret: "cluster-dev-secret"
+
+oidc:
+  enabled: false

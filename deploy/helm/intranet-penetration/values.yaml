@@ -1,19 +1,27 @@
-replicaCount: 2
-
 image:
   repository: intranet-penetration
-  tag: "0.3.0"
+  tag: "0.4.0"
   pullPolicy: IfNotPresent
 
-service:
-  type: LoadBalancer
+control:
+  replicas: 1
+  apiPort: 8090
+  persistence:
+    enabled: true
+    size: 1Gi
+
+edge:
+  # Each replica gets edge_id edge-0, edge-1, ... via StatefulSet ordinal
+  replicas: 2
   tcpPort: 7700
   udpPort: 7700
   httpPort: 8088
   httpsPort: 8443
 
+service:
+  type: LoadBalancer
+
 config:
-  edgeId: edge-1
   region: cn-east
   enableE2E: true
   token: "change-me"
@@ -22,10 +30,12 @@ config:
   baseDomain: "tunnel.example.com"
   clusterSecret: "change-me-cluster"
   redisURL: "redis://redis:6379/0"
+  agentMTLS: "off"
+  accessDefaultDeny: false
 
+# Redis is an external dependency (or deploy separately). Set redisURL above.
 redis:
-  enabled: true
-  architecture: standalone
+  note: "Provide config.redisURL; chart does not embed a Redis subchart."
 
 resources:
   requests:

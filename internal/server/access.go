@@ -28,21 +28,27 @@ func (s *Server) resolveAccessIdentity(r *http.Request) policy.Identity {
 	if key == "" {
 		return policy.Identity{Anonymous: true}
 	}
-	u, _, err := s.store.ResolveUserAPIKey(key)
-	if err != nil {
-		return policy.Identity{Anonymous: true}
+	if s.store != nil {
+		u, _, err := s.store.ResolveUserAPIKey(key)
+		if err != nil {
+			return policy.Identity{Anonymous: true}
+		}
+		return policy.Identity{Email: u.Email, Role: u.Role, UserID: u.ID}
 	}
-	return policy.Identity{
-		Email:  u.Email,
-		Role:   u.Role,
-		UserID: u.ID,
+	if s.ctrl != nil {
+		id, err := s.ctrl.ResolveIdentity(key)
+		if err != nil {
+			return policy.Identity{Anonymous: true}
+		}
+		return policy.Identity{Email: id.Email, Role: id.Role, UserID: id.UserID}
 	}
+	return policy.Identity{Anonymous: true}
 }
 
 func (s *Server) enforceAccess(w http.ResponseWriter, r *http.Request, tenantID, tunnel, action string) bool {
 	id := s.resolveAccessIdentity(r)
 	d := policy.Evaluate(
-		s.store.ListPolicies(tenantID),
+		s.listPolicies(tenantID),
 		tenantID,
 		tunnel,
 		action,
@@ -57,7 +63,7 @@ func (s *Server) enforceAccess(w http.ResponseWriter, r *http.Request, tenantID,
 	if !id.Anonymous {
 		actor = id.Email
 	}
-	s.store.Audit(tenantID, actor, "access.deny", tunnel, d.Reason+" action="+action)
+	s.auditEvent(tenantID, actor, "access.deny", tunnel, d.Reason+" action="+action)
 	if id.Anonymous && (strings.Contains(d.Reason, "identity") ||
 		strings.Contains(d.Reason, "authenticated") ||
 		strings.Contains(d.Reason, "no policy matched")) {
@@ -71,7 +77,7 @@ func (s *Server) enforceAccess(w http.ResponseWriter, r *http.Request, tenantID,
 
 func (s *Server) enforceTCPAccess(tenantID, tunnel, remoteAddr string) error {
 	d := policy.Evaluate(
-		s.store.ListPolicies(tenantID),
+		s.listPolicies(tenantID),
 		tenantID,
 		tunnel,
 		policy.ActionTCP,
@@ -82,6 +88,6 @@ func (s *Server) enforceTCPAccess(tenantID, tunnel, remoteAddr string) error {
 	if d.Allowed {
 		return nil
 	}
-	s.store.Audit(tenantID, "public", "access.deny", tunnel, d.Reason+" action=tcp.access")
+	s.auditEvent(tenantID, "public", "access.deny", tunnel, d.Reason+" action=tcp.access")
 	return store.ErrUnauthorized
 }
