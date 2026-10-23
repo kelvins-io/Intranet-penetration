@@ -22,6 +22,7 @@ import (
 	"github.com/kelvins-io/Intranet-penetration/internal/resume"
 	"github.com/kelvins-io/Intranet-penetration/internal/store"
 	"github.com/kelvins-io/Intranet-penetration/internal/tlsutil"
+	"github.com/kelvins-io/Intranet-penetration/internal/traffic"
 	"github.com/kelvins-io/Intranet-penetration/internal/tunnel"
 	"github.com/quic-go/quic-go"
 )
@@ -29,6 +30,12 @@ import (
 type policyCache struct {
 	mu    sync.RWMutex
 	byTen map[string][]store.AccessPolicy
+	at    time.Time
+}
+
+type trafficCache struct {
+	mu    sync.RWMutex
+	byTen map[string][]store.TrafficPolicy
 	at    time.Time
 }
 
@@ -44,8 +51,10 @@ type Server struct {
 	ca       *tlsutil.CA
 	ctrl     *controlclient.Client // set for edge-only
 	metrics  *metrics.Collector
+	limiter  *traffic.Limiter
 	log      *slog.Logger
 	policies policyCache
+	traffic  trafficCache
 	revoked  struct {
 		mu      sync.RWMutex
 		serials map[string]struct{}
@@ -69,10 +78,12 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 		registry: NewRegistry(),
 		resume:   resume.New(cfg.ResumeTTL),
 		metrics:  metrics.New(),
+		limiter:  traffic.NewLimiter(),
 		log:      log,
 		tcpStops: make(map[string]context.CancelFunc),
 	}
 	s.policies.byTen = map[string][]store.AccessPolicy{}
+	s.traffic.byTen = map[string][]store.TrafficPolicy{}
 	s.revoked.serials = map[string]struct{}{}
 
 	var err error
@@ -952,11 +963,44 @@ func (s *Server) listPolicies(tenantID string) []store.AccessPolicy {
 	return p
 }
 
+func (s *Server) listTrafficPolicies(tenantID string) []store.TrafficPolicy {
+	if s.store != nil {
+		return s.store.ListTrafficPolicies(tenantID)
+	}
+	s.traffic.mu.RLock()
+	if time.Since(s.traffic.at) < 15*time.Second {
+		if p, ok := s.traffic.byTen[tenantID]; ok {
+			s.traffic.mu.RUnlock()
+			return p
+		}
+	}
+	s.traffic.mu.RUnlock()
+	if s.ctrl == nil {
+		return nil
+	}
+	p, err := s.ctrl.ListTrafficPolicies(tenantID)
+	if err != nil {
+		s.log.Debug("traffic policy fetch", "err", err)
+		s.traffic.mu.RLock()
+		defer s.traffic.mu.RUnlock()
+		return s.traffic.byTen[tenantID]
+	}
+	s.traffic.mu.Lock()
+	s.traffic.byTen[tenantID] = p
+	s.traffic.at = time.Now()
+	s.traffic.mu.Unlock()
+	return p
+}
+
 func (s *Server) invalidatePolicyCache() {
 	s.policies.mu.Lock()
 	s.policies.byTen = map[string][]store.AccessPolicy{}
 	s.policies.at = time.Time{}
 	s.policies.mu.Unlock()
+	s.traffic.mu.Lock()
+	s.traffic.byTen = map[string][]store.TrafficPolicy{}
+	s.traffic.at = time.Time{}
+	s.traffic.mu.Unlock()
 }
 
 func (s *Server) auditEvent(tenantID, actor, action, target, detail string) {

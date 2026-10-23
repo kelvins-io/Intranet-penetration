@@ -17,6 +17,7 @@ func (s *Server) mountInternalAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/internal/v1/agent/online", s.withClusterSecret(s.handleInternalOnline))
 	mux.HandleFunc("/internal/v1/agent/offline", s.withClusterSecret(s.handleInternalOffline))
 	mux.HandleFunc("/internal/v1/policies", s.withClusterSecret(s.handleInternalPolicies))
+	mux.HandleFunc("/internal/v1/traffic-policies", s.withClusterSecret(s.handleInternalTrafficPolicies))
 	mux.HandleFunc("/internal/v1/ca", s.withClusterSecret(s.handleInternalCA))
 	mux.HandleFunc("/internal/v1/certs/revoked", s.withClusterSecret(s.handleInternalRevoked))
 	mux.HandleFunc("/internal/v1/resolve", s.withClusterSecret(s.handleInternalResolve))
@@ -202,6 +203,11 @@ func (s *Server) handleInternalOffline(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInternalPolicies(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.URL.Query().Get("tenant")
 	writeJSON(w, http.StatusOK, s.store.ListPolicies(tenantID))
+}
+
+func (s *Server) handleInternalTrafficPolicies(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.URL.Query().Get("tenant")
+	writeJSON(w, http.StatusOK, s.store.ListTrafficPolicies(tenantID))
 }
 
 func (s *Server) handleInternalCA(w http.ResponseWriter, r *http.Request) {

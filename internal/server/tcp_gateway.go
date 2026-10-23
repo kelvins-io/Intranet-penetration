@@ -52,11 +52,19 @@ func (s *Server) startTCPListener(ctx context.Context, routeKey string, port int
 
 func (s *Server) handleTCPConn(tenantID, tunnelName string, client net.Conn) {
 	defer client.Close()
-	if err := s.enforceTCPAccess(tenantID, tunnelName, client.RemoteAddr().String()); err != nil {
-		s.log.Warn("tcp access denied", "tunnel", tunnelName, "remote", client.RemoteAddr().String())
+	remote := client.RemoteAddr().String()
+	if err := s.enforceTCPAccess(tenantID, tunnelName, remote); err != nil {
+		s.log.Warn("tcp access denied", "tunnel", tunnelName, "remote", remote)
 		return
 	}
-	stream, err := s.registry.OpenToAgent(tenantID, tunnelName, client.RemoteAddr().String())
+	release, err := s.enforceTCPTraffic(tenantID, tunnelName, remote)
+	if err != nil {
+		s.log.Warn("tcp traffic limited", "tunnel", tunnelName, "remote", remote)
+		return
+	}
+	defer release()
+
+	stream, err := s.registry.OpenToAgent(tenantID, tunnelName, remote)
 	if err != nil {
 		s.log.Warn("open agent stream", "tunnel", tunnelName, "err", err)
 		return
@@ -65,6 +73,6 @@ func (s *Server) handleTCPConn(tenantID, tunnelName string, client net.Conn) {
 	if route, ok := s.registry.Get(tenantID, tunnelName); ok && route.Session != nil && route.Session.E2E() {
 		s.metrics.IncE2E()
 	}
-	s.store.Audit(tenantID, "public", "tcp.access", tunnelName, client.RemoteAddr().String())
+	s.auditEvent(tenantID, "public", "tcp.access", tunnelName, remote)
 	tunnel.Proxy(client, stream)
 }

@@ -1,26 +1,25 @@
 # Intranet Penetration
 
-工业级内网穿透平台。当前进度：**真正的 Edge / Control 部署拓扑**。
+工业级内网穿透平台。当前进度：**流量策略 / 限流**。
 
 ## 架构
 
 ```
-公网用户 ──► Edge(:8088/:8443) ── Access Policy ──► 本机 Agent session
-                │ miss
-                ▼
-           Peer Edge (/internal/forward)
+公网用户 ──► Edge(:8088/:8443)
+              │  Access Policy → Traffic Policy (RPS/并发)
+              ▼
+         本机 Agent session / Peer Edge forward
 
-Agent ── mTLS? ──► Edge(:7700) ── POST /internal/v1/* ──► Control(:8090)
-                                                      │
-                                                 store.json + CA
-Redis ◄── Edge heartbeat / tunnel location ───────────┘（Control 只读目录）
+Agent ──► Edge(:7700) ── /internal/v1/* ──► Control(:8090)
+                                         store.json + CA + 策略权威
+Redis ◄── Edge heartbeat / tunnel location
 ```
 
 | 角色 | 二进制 | 职责 |
 |------|--------|------|
-| **Control** | `cmd/control` | API、Dashboard、OIDC、策略/证书、租户权威、内部 RPC |
-| **Edge** | `cmd/edge` | Agent mux、公网网关、TCP 段、本机会话、Redis 位置 |
-| **all** | `cmd/server` | 本地单体（默认），行为与拆分前一致 |
+| **Control** | `cmd/control` | API、Dashboard、OIDC、策略/证书/限流配置、内部 RPC |
+| **Edge** | `cmd/edge` | Agent mux、公网网关、TCP、限流执行、Redis 位置 |
+| **all** | `cmd/server` | 本地单体（默认） |
 
 ## 快速开始（本地单体）
 
@@ -31,58 +30,42 @@ curl http://127.0.0.1:8088/default/demo/
 open http://127.0.0.1:8088/dashboard/
 ```
 
-## 拆分拓扑（本地）
+## 流量策略 / 限流
+
+Access 通过后，按最高优先级 `TrafficPolicy` 在 Edge 本机限流（token bucket + 并发计数）。
+
+| 字段 | 说明 |
+|------|------|
+| `rate_rps` / `burst` | 每秒请求/连接速率与突发（0=不限） |
+| `max_concurrent` | 最大并发（0=不限） |
+| `scope` | `ip` / `tunnel` / `ip+tunnel` |
+| `tunnels` | 隧道名或 `*` |
 
 ```bash
-# 终端 1
-make run-control
-# 终端 2
-make run-edge
-# 终端 3
-make run-agent
-
-# API / Dashboard 在 Control
-open http://127.0.0.1:8090/dashboard/
-# 公网入口在 Edge
-curl http://127.0.0.1:8088/default/demo/
+# 单体时 API 在 :8088；拆分拓扑在 Control :8090
+curl -H "Authorization: Bearer $KEY" -X POST http://127.0.0.1:8088/api/v1/traffic-policies \
+  -d '{"name":"demo-limit","priority":100,"tunnels":["demo"],"scope":"ip+tunnel","rate_rps":20,"burst":40,"max_concurrent":100}'
 ```
 
-配置见 [`configs/control.yaml`](configs/control.yaml)、[`configs/edge.yaml`](configs/edge.yaml)。多 Edge 时每个进程使用唯一 `edge_id`，并配置同一 `cluster.secret` + Redis。
+超限：HTTP `429`（`Retry-After: 1`）；TCP 拒绝并审计 `traffic.deny`。
 
-## 私有化部署
+## 拆分拓扑
 
 ```bash
-chmod +x scripts/private-install.sh
-./scripts/private-install.sh
-# → redis + control(:8090) + edge(:7700/:8088/:8443)
+make run-control && make run-edge && make run-agent
+open http://127.0.0.1:8090/dashboard/
+```
 
+## 私有化
+
+```bash
+./scripts/private-install.sh
 helm upgrade --install ip deploy/helm/intranet-penetration
 ```
-
-Helm：Control Deployment（PVC）+ Edge StatefulSet（每副本独立 `edge_id`）。需自备 Redis（`config.redisURL`）。
-
-## 能力一览
-
-| 阶段 | 能力 |
-|------|------|
-| P0–P3 | 隧道、多租户、HTTPS、QUIC、E2E、多区域、SLA/合规 |
-| Access Policy + mTLS | 访问策略、Agent 证书签发/吊销 |
-| **当前** | **Control / Edge 进程分离、内部 RPC、Compose/Helm 拓扑** |
 
 ## API 摘录
 
 ```bash
-# Control
-curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8090/api/v1/policies
-curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8090/api/v1/certs
-curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8090/api/v1/cluster
-
-# Edge 健康检查（无公开管理 API）
-curl http://127.0.0.1:8088/healthz
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8088/api/v1/traffic-policies
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8088/api/v1/policies
 ```
-
-## 路线图
-
-- **P0–P3**：隧道平台 → 多租户 → 集群/QUIC → E2E/私有化
-- **Access Policy + mTLS**
-- **当前**：真正的 Edge / Control 部署拓扑

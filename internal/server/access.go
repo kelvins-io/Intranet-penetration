@@ -56,23 +56,35 @@ func (s *Server) enforceAccess(w http.ResponseWriter, r *http.Request, tenantID,
 		id,
 		s.cfg.AccessDefaultDeny,
 	)
-	if d.Allowed {
-		return true
-	}
-	actor := "anonymous"
-	if !id.Anonymous {
-		actor = id.Email
-	}
-	s.auditEvent(tenantID, actor, "access.deny", tunnel, d.Reason+" action="+action)
-	if id.Anonymous && (strings.Contains(d.Reason, "identity") ||
-		strings.Contains(d.Reason, "authenticated") ||
-		strings.Contains(d.Reason, "no policy matched")) {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="tunnel"`)
-		http.Error(w, "unauthorized: "+d.Reason, http.StatusUnauthorized)
+	if !d.Allowed {
+		actor := "anonymous"
+		if !id.Anonymous {
+			actor = id.Email
+		}
+		s.auditEvent(tenantID, actor, "access.deny", tunnel, d.Reason+" action="+action)
+		if id.Anonymous && (strings.Contains(d.Reason, "identity") ||
+			strings.Contains(d.Reason, "authenticated") ||
+			strings.Contains(d.Reason, "no policy matched")) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="tunnel"`)
+			http.Error(w, "unauthorized: "+d.Reason, http.StatusUnauthorized)
+			return false
+		}
+		http.Error(w, "forbidden: "+d.Reason, http.StatusForbidden)
 		return false
 	}
-	http.Error(w, "forbidden: "+d.Reason, http.StatusForbidden)
-	return false
+	return true
+}
+
+// enforceTraffic returns a release func that must be deferred by the caller.
+func (s *Server) enforceTraffic(w http.ResponseWriter, tenantID, tunnel, remoteAddr string) (release func(), ok bool) {
+	td := s.limiter.Allow(s.listTrafficPolicies(tenantID), tenantID, tunnel, remoteAddr)
+	if td.Allowed {
+		return td.Release, true
+	}
+	s.auditEvent(tenantID, "public", "traffic.deny", tunnel, td.Reason+" policy="+td.Policy)
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "too many requests: "+td.Reason, http.StatusTooManyRequests)
+	return func() {}, false
 }
 
 func (s *Server) enforceTCPAccess(tenantID, tunnel, remoteAddr string) error {
@@ -85,9 +97,18 @@ func (s *Server) enforceTCPAccess(tenantID, tunnel, remoteAddr string) error {
 		policy.Identity{Anonymous: true},
 		s.cfg.AccessDefaultDeny,
 	)
-	if d.Allowed {
-		return nil
+	if !d.Allowed {
+		s.auditEvent(tenantID, "public", "access.deny", tunnel, d.Reason+" action=tcp.access")
+		return store.ErrUnauthorized
 	}
-	s.auditEvent(tenantID, "public", "access.deny", tunnel, d.Reason+" action=tcp.access")
-	return store.ErrUnauthorized
+	return nil
+}
+
+func (s *Server) enforceTCPTraffic(tenantID, tunnel, remoteAddr string) (release func(), err error) {
+	td := s.limiter.Allow(s.listTrafficPolicies(tenantID), tenantID, tunnel, remoteAddr)
+	if td.Allowed {
+		return td.Release, nil
+	}
+	s.auditEvent(tenantID, "public", "traffic.deny", tunnel, td.Reason+" policy="+td.Policy)
+	return func() {}, store.ErrUnauthorized
 }

@@ -102,6 +102,18 @@ func (c *Client) ListPolicies(tenantID string) ([]store.AccessPolicy, error) {
 	return out, nil
 }
 
+func (c *Client) ListTrafficPolicies(tenantID string) ([]store.TrafficPolicy, error) {
+	var out []store.TrafficPolicy
+	path := "/internal/v1/traffic-policies"
+	if tenantID != "" {
+		path += "?tenant=" + url.QueryEscape(tenantID)
+	}
+	if err := c.doJSON(http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *Client) CAPEM() ([]byte, error) {
 	return c.doBytes(http.MethodGet, "/internal/v1/ca")
 }

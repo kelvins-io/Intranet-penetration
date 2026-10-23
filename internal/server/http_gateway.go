@@ -53,6 +53,11 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.enforceAccess(w, r, tenantID, name, "http.access") {
 		return
 	}
+	release, ok := s.enforceTraffic(w, tenantID, name, r.RemoteAddr)
+	if !ok {
+		return
+	}
+	defer release()
 
 	if route, exists := s.registry.Get(tenantID, name); exists && route.Type == protocol.TunnelHTTP {
 		s.proxyLocalHTTP(w, r, tenantID, name, rest)

@@ -168,6 +168,30 @@
       </section>
       <section class="card">
         <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2>流量策略 / 限流</h2>
+          <div class="row">
+            <input id="tpName" placeholder="策略名" style="width:100px" />
+            <input id="tpPriority" placeholder="优先级" value="100" style="width:70px" />
+            <input id="tpTunnels" placeholder="tunnels" value="*" style="width:80px" />
+            <select id="tpScope">
+              <option value="ip+tunnel">ip+tunnel</option>
+              <option value="ip">ip</option>
+              <option value="tunnel">tunnel</option>
+            </select>
+            <input id="tpRPS" placeholder="RPS" value="10" style="width:60px" />
+            <input id="tpBurst" placeholder="Burst" value="20" style="width:60px" />
+            <input id="tpConc" placeholder="并发" value="50" style="width:60px" />
+            <button id="btnTraffic">创建</button>
+          </div>
+        </div>
+        <p class="muted">Access 通过后生效；HTTP 超限返回 429，TCP 超限直接断开。0 表示该维度不限。</p>
+        <table>
+          <thead><tr><th>名称</th><th>优先级</th><th>隧道</th><th>Scope</th><th>RPS</th><th>Burst</th><th>并发</th><th>状态</th><th></th></tr></thead>
+          <tbody id="trafficPolicies"></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
           <h2>Agent mTLS 证书</h2>
           <div class="row">
             <input id="certAgent" placeholder="agent_id" value="dev-agent" style="width:140px" />
@@ -308,6 +332,23 @@
           </td>
         </tr>`).join('') || '<tr><td colspan="8" class="muted">暂无策略（默认放行，除非 access_default_deny）</td></tr>';
 
+      const tpols = await api('/api/v1/traffic-policies');
+      document.getElementById('trafficPolicies').innerHTML = tpols.map(p => `
+        <tr>
+          <td>${p.name}</td>
+          <td>${p.priority}</td>
+          <td class="muted">${(p.tunnels||[]).join(', ')}</td>
+          <td>${p.scope || 'ip+tunnel'}</td>
+          <td>${p.rate_rps || 0}</td>
+          <td>${p.burst || 0}</td>
+          <td>${p.max_concurrent || 0}</td>
+          <td><span class="pill ${p.enabled ? 'on' : 'off'}">${p.enabled ? 'on' : 'off'}</span></td>
+          <td class="row">
+            <button class="secondary" data-tp-toggle="${p.id}" data-on="${p.enabled}">${p.enabled ? '禁用' : '启用'}</button>
+            <button class="secondary" data-tp-del="${p.id}">删除</button>
+          </td>
+        </tr>`).join('') || '<tr><td colspan="9" class="muted">暂无限流策略</td></tr>';
+
       const certs = await api('/api/v1/certs');
       document.getElementById('certs').innerHTML = certs.map(c => `
         <tr>
@@ -383,6 +424,37 @@
         }),
       });
       await refresh();
+    };
+    document.getElementById('btnTraffic').onclick = async () => {
+      const split = (s) => s.split(/[, ]+/).map(x => x.trim()).filter(Boolean);
+      await api('/api/v1/traffic-policies', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: document.getElementById('tpName').value || 'limit',
+          priority: parseInt(document.getElementById('tpPriority').value || '100', 10),
+          tunnels: split(document.getElementById('tpTunnels').value),
+          scope: document.getElementById('tpScope').value,
+          rate_rps: parseFloat(document.getElementById('tpRPS').value || '0'),
+          burst: parseInt(document.getElementById('tpBurst').value || '0', 10),
+          max_concurrent: parseInt(document.getElementById('tpConc').value || '0', 10),
+        }),
+      });
+      await refresh();
+    };
+    document.getElementById('trafficPolicies').onclick = async (ev) => {
+      const t = ev.target;
+      if (t.dataset.tpDel) {
+        await api('/api/v1/traffic-policies?id=' + encodeURIComponent(t.dataset.tpDel), { method: 'DELETE' });
+        await refresh();
+      }
+      if (t.dataset.tpToggle) {
+        const on = t.dataset.on === 'true';
+        await api('/api/v1/traffic-policies?id=' + encodeURIComponent(t.dataset.tpToggle), {
+          method: 'PATCH',
+          body: JSON.stringify({ enabled: !on }),
+        });
+        await refresh();
+      }
     };
     document.getElementById('btnCert').onclick = async () => {
       const out = await api('/api/v1/certs', {

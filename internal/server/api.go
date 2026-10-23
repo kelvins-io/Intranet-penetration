@@ -35,6 +35,7 @@ func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/sla/report", s.withAuth(s.handleSLAReport))
 	mux.HandleFunc("/api/v1/compliance/export", s.withAuth(s.handleComplianceExport))
 	mux.HandleFunc("/api/v1/policies", s.withAuth(s.handlePolicies))
+	mux.HandleFunc("/api/v1/traffic-policies", s.withAuth(s.handleTrafficPolicies))
 	mux.HandleFunc("/api/v1/certs", s.withAuth(s.handleCerts))
 	mux.HandleFunc("/api/v1/certs/ca", s.withAuth(s.handleCACert))
 	// backward compatible
@@ -318,8 +319,9 @@ func (s *Server) handleComplianceExport(w http.ResponseWriter, r *http.Request, 
 		"audits":      s.store.ListAudits(tenantID, 1000),
 		"users":       s.store.ListUsers(tenantID),
 		"tokens":      s.store.ListAgentTokens(tenantID),
-		"policies":    s.store.ListPolicies(tenantID),
-		"agent_certs": s.store.ListAgentCerts(tenantID),
+		"policies":          s.store.ListPolicies(tenantID),
+		"traffic_policies":  s.store.ListTrafficPolicies(tenantID),
+		"agent_certs":       s.store.ListAgentCerts(tenantID),
 		"agent_mtls":  s.cfg.AgentMTLS,
 		"access_default_deny": s.cfg.AccessDefaultDeny,
 		"sla":         s.metrics.Snapshot(),
@@ -477,6 +479,91 @@ func (s *Server) handlePolicies(w http.ResponseWriter, r *http.Request, au *apiU
 			return
 		}
 		s.store.Audit(au.Tenant.ID, au.User.Email, "policy.delete", id, "")
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleTrafficPolicies(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.ListTrafficPolicies(au.Tenant.ID))
+	case http.MethodPost:
+		var body struct {
+			Name          string   `json:"name"`
+			Enabled       *bool    `json:"enabled"`
+			Priority      int      `json:"priority"`
+			Tunnels       []string `json:"tunnels"`
+			Scope         string   `json:"scope"`
+			RateRPS       float64  `json:"rate_rps"`
+			Burst         int      `json:"burst"`
+			MaxConcurrent int      `json:"max_concurrent"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		enabled := true
+		if body.Enabled != nil {
+			enabled = *body.Enabled
+		}
+		p, err := s.store.CreateTrafficPolicy(store.TrafficPolicy{
+			TenantID:      au.Tenant.ID,
+			Name:          body.Name,
+			Enabled:       enabled,
+			Priority:      body.Priority,
+			Tunnels:       body.Tunnels,
+			Scope:         body.Scope,
+			RateRPS:       body.RateRPS,
+			Burst:         body.Burst,
+			MaxConcurrent: body.MaxConcurrent,
+		})
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "traffic.create", p.ID, p.Name)
+		writeJSON(w, http.StatusCreated, p)
+	case http.MethodPatch:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "id required")
+			return
+		}
+		var body struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Enabled == nil {
+			writeErr(w, http.StatusBadRequest, "enabled required")
+			return
+		}
+		p, err := s.store.SetTrafficPolicyEnabled(id, *body.Enabled)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "traffic.update", p.ID, strconv.FormatBool(p.Enabled))
+		writeJSON(w, http.StatusOK, p)
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "id required")
+			return
+		}
+		if err := s.store.DeleteTrafficPolicy(id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "traffic.delete", id, "")
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
