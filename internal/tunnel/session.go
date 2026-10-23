@@ -196,6 +196,7 @@ func (s *Session) OpenDataStream(tunnel, meta string) (net.Conn, error) {
 	if err := protocol.WriteJSON(stream, protocol.MsgOpen, protocol.OpenRequest{
 		Tunnel: tunnel,
 		Meta:   meta,
+		Mode:   protocol.TunnelTCP,
 		E2E:    s.e2e,
 	}); err != nil {
 		_ = stream.Close()

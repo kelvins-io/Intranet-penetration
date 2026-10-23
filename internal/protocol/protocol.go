@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version = 3
+	Version = 4
 
 	MaxFrameSize = 1 << 20 // 1 MiB
 )
@@ -30,7 +30,21 @@ type TunnelType string
 const (
 	TunnelTCP  TunnelType = "tcp"
 	TunnelHTTP TunnelType = "http"
+	TunnelUDP  TunnelType = "udp"
 )
+
+// DevicePosture is agent-reported device posture for Zero-Trust style checks.
+type DevicePosture struct {
+	OS           string            `json:"os,omitempty"`            // darwin|linux|windows
+	Arch         string            `json:"arch,omitempty"`          // amd64|arm64|...
+	Hostname     string            `json:"hostname,omitempty"`
+	AgentVersion string            `json:"agent_version,omitempty"`
+	DeviceID     string            `json:"device_id,omitempty"` // stable device fingerprint
+	Encrypted    *bool             `json:"encrypted,omitempty"` // disk encryption
+	Firewall     *bool             `json:"firewall,omitempty"`
+	ScreenLock   *bool             `json:"screen_lock,omitempty"`
+	Attrs        map[string]string `json:"attrs,omitempty"` // custom key=value
+}
 
 // TunnelSpec is declared by the agent during handshake.
 type TunnelSpec struct {
@@ -44,13 +58,14 @@ type TunnelSpec struct {
 }
 
 type Hello struct {
-	Version     int          `json:"version"`
-	Token       string       `json:"token"`
-	AgentID     string       `json:"agent_id"`
-	ResumeToken string       `json:"resume_token,omitempty"`
-	PreferE2E   bool         `json:"prefer_e2e,omitempty"`
-	Region      string       `json:"region,omitempty"`
-	Tunnels     []TunnelSpec `json:"tunnels"`
+	Version     int           `json:"version"`
+	Token       string        `json:"token"`
+	AgentID     string        `json:"agent_id"`
+	ResumeToken string        `json:"resume_token,omitempty"`
+	PreferE2E   bool          `json:"prefer_e2e,omitempty"`
+	Region      string        `json:"region,omitempty"`
+	Posture     DevicePosture `json:"posture,omitempty"`
+	Tunnels     []TunnelSpec  `json:"tunnels"`
 }
 
 type AssignedTunnel struct {
@@ -77,9 +92,10 @@ type HelloAck struct {
 
 // OpenRequest is sent by the server on a new yamux stream before raw bytes.
 type OpenRequest struct {
-	Tunnel string `json:"tunnel"`
-	Meta   string `json:"meta,omitempty"` // e.g. remote client addr
-	E2E    bool   `json:"e2e,omitempty"`
+	Tunnel string     `json:"tunnel"`
+	Meta   string     `json:"meta,omitempty"` // e.g. remote client addr
+	Mode   TunnelType `json:"mode,omitempty"` // tcp (default) | udp — datagrams framed on stream
+	E2E    bool       `json:"e2e,omitempty"`
 }
 
 type OpenAck struct {

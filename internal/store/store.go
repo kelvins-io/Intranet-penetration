@@ -479,28 +479,28 @@ func (s *Store) CheckTunnelQuota(tenantID, agentID string, names []string, types
 	}
 	existing := map[string]TunnelRecord{}
 	agents := map[string]struct{}{}
-	total, tcp := 0, 0
+	total, portTunnels := 0, 0
 	for _, t := range s.data.Tunnels {
 		if t.TenantID != tenantID {
 			continue
 		}
 		existing[t.Name] = t
 		total++
-		if t.Type == "tcp" {
-			tcp++
+		if t.Type == "tcp" || t.Type == "udp" {
+			portTunnels++
 		}
 		if t.Online && t.AgentID != "" {
 			agents[t.AgentID] = struct{}{}
 		}
 	}
-	addTunnels, addTCP := 0, 0
+	addTunnels, addPorts := 0, 0
 	for i, name := range names {
 		if _, ok := existing[name]; ok {
 			continue
 		}
 		addTunnels++
-		if i < len(types) && types[i] == "tcp" {
-			addTCP++
+		if i < len(types) && (types[i] == "tcp" || types[i] == "udp") {
+			addPorts++
 		}
 	}
 	if _, ok := agents[agentID]; !ok && agentID != "" {
@@ -511,8 +511,9 @@ func (s *Store) CheckTunnelQuota(tenantID, agentID string, names []string, types
 	if total+addTunnels > ten.Quota.MaxTunnels {
 		return fmt.Errorf("%w: tunnels", ErrQuotaExceeded)
 	}
-	if tcp+addTCP > ten.Quota.MaxTCP {
-		return fmt.Errorf("%w: tcp ports", ErrQuotaExceeded)
+	// TCP+UDP public ports share MaxTCP quota.
+	if portTunnels+addPorts > ten.Quota.MaxTCP {
+		return fmt.Errorf("%w: tcp/udp ports", ErrQuotaExceeded)
 	}
 	return nil
 }
@@ -880,4 +881,87 @@ func (s *Store) SetTrafficPolicyEnabled(id string, enabled bool) (*TrafficPolicy
 		}
 	}
 	return nil, ErrNotFound
+}
+
+func (s *Store) ListPosturePolicies(tenantID string) []PosturePolicy {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []PosturePolicy{}
+	for _, p := range s.data.PosturePolicies {
+		if tenantID == "" || p.TenantID == tenantID {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (s *Store) CreatePosturePolicy(p PosturePolicy) (*PosturePolicy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.TenantID == "" || p.Name == "" {
+		return nil, fmt.Errorf("tenant_id and name required")
+	}
+	if p.ID == "" {
+		p.ID = NewID("ppol")
+	}
+	p.CreatedAt = time.Now().UTC()
+	s.data.PosturePolicies = append(s.data.PosturePolicies, p)
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (s *Store) DeletePosturePolicy(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, p := range s.data.PosturePolicies {
+		if p.ID == id {
+			s.data.PosturePolicies = append(s.data.PosturePolicies[:i], s.data.PosturePolicies[i+1:]...)
+			return s.persistLocked()
+		}
+	}
+	return ErrNotFound
+}
+
+func (s *Store) SetPosturePolicyEnabled(id string, enabled bool) (*PosturePolicy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.PosturePolicies {
+		if s.data.PosturePolicies[i].ID == id {
+			s.data.PosturePolicies[i].Enabled = enabled
+			if err := s.persistLocked(); err != nil {
+				return nil, err
+			}
+			cp := s.data.PosturePolicies[i]
+			return &cp, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (s *Store) UpsertAgentPosture(p AgentPosture) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p.UpdatedAt = time.Now().UTC()
+	for i := range s.data.AgentPostures {
+		if s.data.AgentPostures[i].TenantID == p.TenantID && s.data.AgentPostures[i].AgentID == p.AgentID {
+			s.data.AgentPostures[i] = p
+			return s.persistLocked()
+		}
+	}
+	s.data.AgentPostures = append(s.data.AgentPostures, p)
+	return s.persistLocked()
+}
+
+func (s *Store) ListAgentPostures(tenantID string) []AgentPosture {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []AgentPosture{}
+	for _, p := range s.data.AgentPostures {
+		if tenantID == "" || p.TenantID == tenantID {
+			out = append(out, p)
+		}
+	}
+	return out
 }

@@ -122,18 +122,29 @@ type AgentMTLSConfig struct {
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 }
 
+// AgentPostureConfig is statically declared device posture (merged with runtime facts).
+type AgentPostureConfig struct {
+	DeviceID   string            `yaml:"device_id"`
+	Encrypted  *bool             `yaml:"encrypted"`
+	Firewall   *bool             `yaml:"firewall"`
+	ScreenLock *bool             `yaml:"screen_lock"`
+	Attrs      map[string]string `yaml:"attrs"`
+	Version    string            `yaml:"agent_version"` // override reported version
+}
+
 type AgentConfig struct {
-	ServerAddr      string          `yaml:"server_addr"`
-	QUICAddr        string          `yaml:"quic_addr"`
-	PreferQUIC      bool            `yaml:"prefer_quic"`
-	PreferE2E       bool            `yaml:"prefer_e2e"`
-	Region          string          `yaml:"region"`
-	Token           string          `yaml:"token"`
-	AgentID         string          `yaml:"agent_id"`
-	Tunnels         []AgentTunnel   `yaml:"tunnels"`
-	Reconnect       time.Duration   `yaml:"reconnect"`
-	ResumeTokenFile string          `yaml:"resume_token_file"`
-	MTLS            AgentMTLSConfig `yaml:"mtls"`
+	ServerAddr      string             `yaml:"server_addr"`
+	QUICAddr        string             `yaml:"quic_addr"`
+	PreferQUIC      bool               `yaml:"prefer_quic"`
+	PreferE2E       bool               `yaml:"prefer_e2e"`
+	Region          string             `yaml:"region"`
+	Token           string             `yaml:"token"`
+	AgentID         string             `yaml:"agent_id"`
+	Tunnels         []AgentTunnel      `yaml:"tunnels"`
+	Reconnect       time.Duration      `yaml:"reconnect"`
+	ResumeTokenFile string             `yaml:"resume_token_file"`
+	MTLS            AgentMTLSConfig    `yaml:"mtls"`
+	Posture         AgentPostureConfig `yaml:"posture"`
 }
 
 func LoadServer(path string) (*ServerConfig, error) {
@@ -263,8 +274,10 @@ func LoadAgent(path string) (*AgentConfig, error) {
 		if t.Type == "" {
 			cfg.Tunnels[i].Type = "http"
 		}
-		if cfg.Tunnels[i].Type != "tcp" && cfg.Tunnels[i].Type != "http" {
-			return nil, fmt.Errorf("tunnel[%d]: type must be tcp or http", i)
+		switch cfg.Tunnels[i].Type {
+		case "tcp", "http", "udp":
+		default:
+			return nil, fmt.Errorf("tunnel[%d]: type must be tcp, http, or udp", i)
 		}
 	}
 	return cfg, nil

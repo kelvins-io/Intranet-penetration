@@ -192,6 +192,28 @@
       </section>
       <section class="card">
         <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2>设备姿态策略</h2>
+          <div class="row">
+            <input id="ppName" placeholder="策略名" style="width:100px" />
+            <input id="ppOS" placeholder="require_os" value="darwin,linux" style="width:120px" />
+            <input id="ppVer" placeholder="min version" value="0.4.0" style="width:80px" />
+            <label class="muted"><input type="checkbox" id="ppEnc" /> 磁盘加密</label>
+            <label class="muted"><input type="checkbox" id="ppFw" /> 防火墙</label>
+            <button id="btnPosture">创建</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>名称</th><th>OS</th><th>MinVer</th><th>加密</th><th>防火墙</th><th>状态</th><th></th></tr></thead>
+          <tbody id="posturePolicies"></tbody>
+        </table>
+        <h2 style="margin-top:16px">Agent 姿态上报</h2>
+        <table>
+          <thead><tr><th>Agent</th><th>OS/Arch</th><th>Hostname</th><th>Version</th><th>Device</th><th>更新</th></tr></thead>
+          <tbody id="agentPostures"></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
           <h2>Agent mTLS 证书</h2>
           <div class="row">
             <input id="certAgent" placeholder="agent_id" value="dev-agent" style="width:140px" />
@@ -349,6 +371,32 @@
           </td>
         </tr>`).join('') || '<tr><td colspan="9" class="muted">暂无限流策略</td></tr>';
 
+      const ppols = await api('/api/v1/posture-policies');
+      document.getElementById('posturePolicies').innerHTML = ppols.map(p => `
+        <tr>
+          <td>${p.name}</td>
+          <td class="muted">${(p.require_os||[]).join(',')||'-'}</td>
+          <td>${p.min_agent_version||'-'}</td>
+          <td>${p.require_encrypted ? 'yes' : '-'}</td>
+          <td>${p.require_firewall ? 'yes' : '-'}</td>
+          <td><span class="pill ${p.enabled ? 'on' : 'off'}">${p.enabled ? 'on' : 'off'}</span></td>
+          <td class="row">
+            <button class="secondary" data-pp-toggle="${p.id}" data-on="${p.enabled}">${p.enabled ? '禁用' : '启用'}</button>
+            <button class="secondary" data-pp-del="${p.id}">删除</button>
+          </td>
+        </tr>`).join('') || '<tr><td colspan="7" class="muted">无姿态策略（默认放行）</td></tr>';
+
+      const postures = await api('/api/v1/postures');
+      document.getElementById('agentPostures').innerHTML = postures.map(p => `
+        <tr>
+          <td><code>${p.agent_id}</code></td>
+          <td>${p.os||'-'}/${p.arch||'-'}</td>
+          <td class="muted">${p.hostname||'-'}</td>
+          <td>${p.agent_version||'-'}</td>
+          <td class="muted">${p.device_id||'-'}</td>
+          <td class="muted">${p.updated_at ? new Date(p.updated_at).toLocaleString() : '-'}</td>
+        </tr>`).join('') || '<tr><td colspan="6" class="muted">暂无上报</td></tr>';
+
       const certs = await api('/api/v1/certs');
       document.getElementById('certs').innerHTML = certs.map(c => `
         <tr>
@@ -424,6 +472,36 @@
         }),
       });
       await refresh();
+    };
+    document.getElementById('btnPosture').onclick = async () => {
+      const split = (s) => s.split(/[, ]+/).map(x => x.trim()).filter(Boolean);
+      await api('/api/v1/posture-policies', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: document.getElementById('ppName').value || 'posture',
+          priority: 100,
+          require_os: split(document.getElementById('ppOS').value),
+          min_agent_version: document.getElementById('ppVer').value || '',
+          require_encrypted: document.getElementById('ppEnc').checked,
+          require_firewall: document.getElementById('ppFw').checked,
+        }),
+      });
+      await refresh();
+    };
+    document.getElementById('posturePolicies').onclick = async (ev) => {
+      const t = ev.target;
+      if (t.dataset.ppDel) {
+        await api('/api/v1/posture-policies?id=' + encodeURIComponent(t.dataset.ppDel), { method: 'DELETE' });
+        await refresh();
+      }
+      if (t.dataset.ppToggle) {
+        const on = t.dataset.on === 'true';
+        await api('/api/v1/posture-policies?id=' + encodeURIComponent(t.dataset.ppToggle), {
+          method: 'PATCH',
+          body: JSON.stringify({ enabled: !on }),
+        });
+        await refresh();
+      }
     };
     document.getElementById('btnTraffic').onclick = async () => {
       const split = (s) => s.split(/[, ]+/).map(x => x.trim()).filter(Boolean);

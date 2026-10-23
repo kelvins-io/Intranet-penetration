@@ -36,6 +36,8 @@ func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/compliance/export", s.withAuth(s.handleComplianceExport))
 	mux.HandleFunc("/api/v1/policies", s.withAuth(s.handlePolicies))
 	mux.HandleFunc("/api/v1/traffic-policies", s.withAuth(s.handleTrafficPolicies))
+	mux.HandleFunc("/api/v1/posture-policies", s.withAuth(s.handlePosturePolicies))
+	mux.HandleFunc("/api/v1/postures", s.withAuth(s.handleAgentPostures))
 	mux.HandleFunc("/api/v1/certs", s.withAuth(s.handleCerts))
 	mux.HandleFunc("/api/v1/certs/ca", s.withAuth(s.handleCACert))
 	// backward compatible
@@ -321,6 +323,8 @@ func (s *Server) handleComplianceExport(w http.ResponseWriter, r *http.Request, 
 		"tokens":      s.store.ListAgentTokens(tenantID),
 		"policies":          s.store.ListPolicies(tenantID),
 		"traffic_policies":  s.store.ListTrafficPolicies(tenantID),
+		"posture_policies":  s.store.ListPosturePolicies(tenantID),
+		"agent_postures":    s.store.ListAgentPostures(tenantID),
 		"agent_certs":       s.store.ListAgentCerts(tenantID),
 		"agent_mtls":  s.cfg.AgentMTLS,
 		"access_default_deny": s.cfg.AccessDefaultDeny,
@@ -568,6 +572,96 @@ func (s *Server) handleTrafficPolicies(w http.ResponseWriter, r *http.Request, a
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *Server) handlePosturePolicies(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.ListPosturePolicies(au.Tenant.ID))
+	case http.MethodPost:
+		var body struct {
+			Name              string            `json:"name"`
+			Enabled           *bool             `json:"enabled"`
+			Priority          int               `json:"priority"`
+			RequireOS         []string          `json:"require_os"`
+			MinAgentVersion   string            `json:"min_agent_version"`
+			RequireEncrypted  bool              `json:"require_encrypted"`
+			RequireFirewall   bool              `json:"require_firewall"`
+			RequireScreenLock bool              `json:"require_screen_lock"`
+			RequireAttrs      map[string]string `json:"require_attrs"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		enabled := true
+		if body.Enabled != nil {
+			enabled = *body.Enabled
+		}
+		p, err := s.store.CreatePosturePolicy(store.PosturePolicy{
+			TenantID:          au.Tenant.ID,
+			Name:              body.Name,
+			Enabled:           enabled,
+			Priority:          body.Priority,
+			RequireOS:         body.RequireOS,
+			MinAgentVersion:   body.MinAgentVersion,
+			RequireEncrypted:  body.RequireEncrypted,
+			RequireFirewall:   body.RequireFirewall,
+			RequireScreenLock: body.RequireScreenLock,
+			RequireAttrs:      body.RequireAttrs,
+		})
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "posture_policy.create", p.ID, p.Name)
+		writeJSON(w, http.StatusCreated, p)
+	case http.MethodPatch:
+		id := r.URL.Query().Get("id")
+		var body struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if id == "" || json.NewDecoder(r.Body).Decode(&body) != nil || body.Enabled == nil {
+			writeErr(w, http.StatusBadRequest, "id and enabled required")
+			return
+		}
+		p, err := s.store.SetPosturePolicyEnabled(id, *body.Enabled)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, p)
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "id required")
+			return
+		}
+		if err := s.store.DeletePosturePolicy(id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "posture_policy.delete", id, "")
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleAgentPostures(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.store.ListAgentPostures(au.Tenant.ID))
 }
 
 func (s *Server) handleCerts(w http.ResponseWriter, r *http.Request, au *apiUser) {

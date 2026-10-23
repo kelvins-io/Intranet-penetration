@@ -63,7 +63,7 @@ func (s *Server) handleInternalHello(w http.ResponseWriter, r *http.Request) {
 
 // validateHelloForControl assigns domains/quota without allocating TCP ports (Edge does that).
 func (s *Server) validateHelloForControl(hello protocol.Hello, publicHost, baseDomain string) (*protocol.HelloAck, *store.Tenant, error) {
-	if hello.Version != 0 && hello.Version != protocol.Version && hello.Version != 1 {
+	if hello.Version != 0 && hello.Version != protocol.Version && hello.Version != 1 && hello.Version != 3 {
 		return nil, nil, fmt.Errorf("unsupported protocol version %d", hello.Version)
 	}
 	if hello.AgentID == "" {
@@ -115,17 +115,20 @@ func (s *Server) validateHelloForControl(hello protocol.Hello, publicHost, baseD
 				Domain:     domain,
 				PublicAddr: s.publicHTTPURLWith(publicHost, tenant.Slug, name, domain),
 			})
-		case protocol.TunnelTCP:
-			// Edge allocates the real port; pass through preferred port as hint.
+		case protocol.TunnelTCP, protocol.TunnelUDP:
 			ack.Tunnels = append(ack.Tunnels, protocol.AssignedTunnel{
 				Name:       name,
-				Type:       protocol.TunnelTCP,
+				Type:       t.Type,
 				RemotePort: t.RemotePort,
-				PublicAddr: fmt.Sprintf("%s:%d", publicHost, t.RemotePort),
+				PublicAddr: fmt.Sprintf("%s:%d/%s", publicHost, t.RemotePort, t.Type),
 			})
 		default:
 			return nil, nil, fmt.Errorf("unsupported tunnel type %q", t.Type)
 		}
+	}
+
+	if err := s.enforcePosture(tenant.ID, hello.AgentID, hello.Posture); err != nil {
+		return nil, nil, err
 	}
 	return ack, tenant, nil
 }

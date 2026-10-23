@@ -19,6 +19,40 @@ func DefaultQuota() Quota {
 	return Quota{MaxAgents: 10, MaxTunnels: 50, MaxTCP: 20}
 }
 
+// PosturePolicy requires agent device posture before handshake succeeds.
+// RequireOS: list of allowed OS (empty = any). RequireAttrs: key=value exact match.
+// RequireEncrypted/Firewall/ScreenLock: when true, posture must report true.
+type PosturePolicy struct {
+	ID               string            `json:"id"`
+	TenantID         string            `json:"tenant_id"`
+	Name             string            `json:"name"`
+	Enabled          bool              `json:"enabled"`
+	Priority         int               `json:"priority"`
+	RequireOS        []string          `json:"require_os,omitempty"`
+	MinAgentVersion  string            `json:"min_agent_version,omitempty"` // semver-ish major.minor.patch
+	RequireEncrypted bool              `json:"require_encrypted,omitempty"`
+	RequireFirewall  bool              `json:"require_firewall,omitempty"`
+	RequireScreenLock bool             `json:"require_screen_lock,omitempty"`
+	RequireAttrs     map[string]string `json:"require_attrs,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+}
+
+// AgentPosture is the last reported posture for an agent.
+type AgentPosture struct {
+	TenantID  string    `json:"tenant_id"`
+	AgentID   string    `json:"agent_id"`
+	OS        string    `json:"os,omitempty"`
+	Arch      string    `json:"arch,omitempty"`
+	Hostname  string    `json:"hostname,omitempty"`
+	Version   string    `json:"agent_version,omitempty"`
+	DeviceID  string    `json:"device_id,omitempty"`
+	Encrypted *bool     `json:"encrypted,omitempty"`
+	Firewall  *bool     `json:"firewall,omitempty"`
+	ScreenLock *bool    `json:"screen_lock,omitempty"`
+	Attrs     map[string]string `json:"attrs,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type Tenant struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -128,4 +162,6 @@ type Snapshot struct {
 	Policies        []AccessPolicy   `json:"policies"`
 	AgentCerts      []AgentCert      `json:"agent_certs"`
 	TrafficPolicies []TrafficPolicy  `json:"traffic_policies"`
+	PosturePolicies []PosturePolicy  `json:"posture_policies"`
+	AgentPostures   []AgentPosture   `json:"agent_postures"`
 }

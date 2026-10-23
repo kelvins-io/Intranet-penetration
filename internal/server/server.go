@@ -18,6 +18,7 @@ import (
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
 	"github.com/kelvins-io/Intranet-penetration/internal/controlclient"
 	"github.com/kelvins-io/Intranet-penetration/internal/metrics"
+	"github.com/kelvins-io/Intranet-penetration/internal/posture"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
 	"github.com/kelvins-io/Intranet-penetration/internal/resume"
 	"github.com/kelvins-io/Intranet-penetration/internal/store"
@@ -539,8 +540,11 @@ func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, re
 			PublicAddr:    assigned.PublicAddr,
 			RemotePort:    assigned.RemotePort,
 		})
-		if assigned.Type == protocol.TunnelTCP {
+		switch assigned.Type {
+		case protocol.TunnelTCP:
 			s.startTCPListener(ctx, route.Key(), assigned.RemotePort, tenant.ID, assigned.Name)
+		case protocol.TunnelUDP:
+			s.startUDPListener(ctx, route.Key(), assigned.RemotePort, tenant.ID, assigned.Name)
 		}
 		s.log.Info("tunnel online",
 			"tenant", tenant.Slug,
@@ -642,7 +646,7 @@ func (s *Server) tryResume(hello protocol.Hello) (*store.Tenant, *protocol.Hello
 	}
 	tunnels := make([]protocol.AssignedTunnel, 0, len(st.Tunnels))
 	for _, t := range st.Tunnels {
-		if t.Type == protocol.TunnelTCP {
+		if t.Type == protocol.TunnelTCP || t.Type == protocol.TunnelUDP {
 			port, err := s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, t.RemotePort)
 			if err != nil {
 				port, err = s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, 0)
@@ -651,7 +655,7 @@ func (s *Server) tryResume(hello protocol.Hello) (*store.Tenant, *protocol.Hello
 				}
 			}
 			t.RemotePort = port
-			t.PublicAddr = fmt.Sprintf("%s:%d", s.cfg.PublicHost, port)
+			t.PublicAddr = fmt.Sprintf("%s:%d/%s", s.cfg.PublicHost, port, t.Type)
 		}
 		tunnels = append(tunnels, t)
 	}
@@ -682,7 +686,7 @@ func (s *Server) validateHelloRemote(hello protocol.Hello) (*protocol.HelloAck, 
 	// Allocate TCP ports locally.
 	for i := range ack.Tunnels {
 		t := &ack.Tunnels[i]
-		if t.Type != protocol.TunnelTCP {
+		if t.Type != protocol.TunnelTCP && t.Type != protocol.TunnelUDP {
 			continue
 		}
 		port, err := s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, t.RemotePort)
@@ -690,14 +694,14 @@ func (s *Server) validateHelloRemote(hello protocol.Hello) (*protocol.HelloAck, 
 			return nil, nil, err
 		}
 		t.RemotePort = port
-		t.PublicAddr = fmt.Sprintf("%s:%d", s.cfg.PublicHost, port)
+		t.PublicAddr = fmt.Sprintf("%s:%d/%s", s.cfg.PublicHost, port, t.Type)
 	}
 	ack.ResumeToken = s.resume.Issue(tenant.ID, hello.AgentID, ack.Tunnels)
 	return &ack, &tenant, nil
 }
 
 func (s *Server) validateHelloLocal(hello protocol.Hello) (*protocol.HelloAck, *store.Tenant, error) {
-	if hello.Version != 0 && hello.Version != protocol.Version && hello.Version != 1 {
+	if hello.Version != 0 && hello.Version != protocol.Version && hello.Version != 1 && hello.Version != 3 {
 		return nil, nil, fmt.Errorf("unsupported protocol version %d", hello.Version)
 	}
 	if hello.AgentID == "" {
@@ -710,6 +714,9 @@ func (s *Server) validateHelloLocal(hello protocol.Hello) (*protocol.HelloAck, *
 	_, tenant, err := s.store.ResolveAgentToken(hello.Token)
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid token")
+	}
+	if err := s.enforcePosture(tenant.ID, hello.AgentID, hello.Posture); err != nil {
+		return nil, nil, err
 	}
 
 	names := make([]string, 0, len(hello.Tunnels))
@@ -752,16 +759,16 @@ func (s *Server) validateHelloLocal(hello protocol.Hello) (*protocol.HelloAck, *
 				Domain:     domain,
 				PublicAddr: s.publicHTTPURL(tenant.Slug, name, domain),
 			})
-		case protocol.TunnelTCP:
+		case protocol.TunnelTCP, protocol.TunnelUDP:
 			port, err := s.registry.AllocatePort(s.cfg.TCPPortMin, s.cfg.TCPPortMax, t.RemotePort)
 			if err != nil {
 				return nil, nil, err
 			}
 			ack.Tunnels = append(ack.Tunnels, protocol.AssignedTunnel{
 				Name:       name,
-				Type:       protocol.TunnelTCP,
+				Type:       t.Type,
 				RemotePort: port,
-				PublicAddr: fmt.Sprintf("%s:%d", s.cfg.PublicHost, port),
+				PublicAddr: fmt.Sprintf("%s:%d/%s", s.cfg.PublicHost, port, t.Type),
 			})
 		default:
 			return nil, nil, fmt.Errorf("unsupported tunnel type %q", t.Type)
@@ -769,6 +776,22 @@ func (s *Server) validateHelloLocal(hello protocol.Hello) (*protocol.HelloAck, *
 	}
 	ack.ResumeToken = s.resume.Issue(tenant.ID, hello.AgentID, ack.Tunnels)
 	return ack, tenant, nil
+}
+
+func (s *Server) enforcePosture(tenantID, agentID string, p protocol.DevicePosture) error {
+	if s.store == nil {
+		return nil // edge remote hello already enforced on control
+	}
+	d := posture.Evaluate(s.store.ListPosturePolicies(tenantID), tenantID, p)
+	_ = s.store.UpsertAgentPosture(posture.ToRecord(tenantID, agentID, p))
+	if !d.Allowed {
+		s.store.Audit(tenantID, agentID, "posture.deny", agentID, d.Reason+" policy="+d.Policy)
+		return fmt.Errorf("device posture denied: %s", d.Reason)
+	}
+	if d.Policy != "" && d.Policy != "no posture policy" {
+		s.store.Audit(tenantID, agentID, "posture.ok", agentID, d.Policy)
+	}
+	return nil
 }
 
 func (s *Server) publicHTTPURL(slug, name, domain string) string {
@@ -799,7 +822,7 @@ func (s *Server) stopTCPListenersForAgent(tenantID, agentID string, tunnels []pr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, t := range tunnels {
-		if t.Type != protocol.TunnelTCP {
+		if t.Type != protocol.TunnelTCP && t.Type != protocol.TunnelUDP {
 			continue
 		}
 		key := store.RouteKey(tenantID, t.Name)

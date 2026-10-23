@@ -14,6 +14,13 @@ mtls:
   cert_file: "data/agent/agent.crt"
   key_file: "data/agent/agent.key"
   insecure_skip_verify: false
+posture:
+  # device_id: "laptop-001"
+  # encrypted: true
+  # firewall: true
+  # screen_lock: true
+  # attrs:
+  #   dept: eng
 tunnels:
   - name: demo
     type: http
@@ -21,3 +28,6 @@ tunnels:
   - name: echo-tcp
     type: tcp
     local_addr: "127.0.0.1:9001"
+  # - name: dns-udp
+  #   type: udp
+  #   local_addr: "127.0.0.1:53"

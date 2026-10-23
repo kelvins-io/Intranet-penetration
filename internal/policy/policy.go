@@ -11,6 +11,7 @@ import (
 const (
 	ActionHTTP = "http.access"
 	ActionTCP  = "tcp.access"
+	ActionUDP  = "udp.access"
 )
 
 // Identity is the caller of a public tunnel access.

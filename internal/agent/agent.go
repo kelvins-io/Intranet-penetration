@@ -88,6 +88,7 @@ func (a *Agent) connectOnce(ctx context.Context) error {
 		ResumeToken: a.resumeToken,
 		PreferE2E:   a.cfg.PreferE2E,
 		Region:      a.cfg.Region,
+		Posture:     a.collectPosture(),
 	}
 	for _, t := range a.cfg.Tunnels {
 		hello.Tunnels = append(hello.Tunnels, protocol.TunnelSpec{
@@ -193,6 +194,34 @@ func (a *Agent) handleStream(ctx context.Context, stream net.Conn, req protocol.
 		return
 	}
 
+	mode := req.Mode
+	if mode == "" {
+		mode = a.tunnelMode(req.Tunnel)
+	}
+	useE2E := req.E2E && a.cfg.PreferE2E
+
+	if mode == protocol.TunnelUDP {
+		if err := tunnel.AckOpenE2E(stream, true, "", useE2E); err != nil {
+			_ = stream.Close()
+			return
+		}
+		if useE2E {
+			sealed, err := tunnel.MaybeSealServer(stream, req, true)
+			if err != nil {
+				_ = stream.Close()
+				a.log.Warn("e2e handshake failed", "err", err)
+				return
+			}
+			stream = sealed
+		}
+		a.log.Info("udp stream opened", "tunnel", req.Tunnel, "meta", req.Meta, "local", localAddr, "e2e", useE2E)
+		if err := tunnel.ProxyUDPAgent(stream, localAddr, 60*time.Second); err != nil {
+			a.log.Debug("udp proxy ended", "err", err)
+		}
+		_ = stream.Close()
+		return
+	}
+
 	var d net.Dialer
 	upstream, err := d.DialContext(ctx, "tcp", localAddr)
 	if err != nil {
@@ -201,7 +230,6 @@ func (a *Agent) handleStream(ctx context.Context, stream net.Conn, req protocol.
 		a.log.Warn("dial local failed", "tunnel", req.Tunnel, "local", localAddr, "err", err)
 		return
 	}
-	useE2E := req.E2E && a.cfg.PreferE2E
 	if err := tunnel.AckOpenE2E(stream, true, "", useE2E); err != nil {
 		_ = upstream.Close()
 		_ = stream.Close()
@@ -219,6 +247,15 @@ func (a *Agent) handleStream(ctx context.Context, stream net.Conn, req protocol.
 	}
 	a.log.Info("stream opened", "tunnel", req.Tunnel, "meta", req.Meta, "local", localAddr, "e2e", useE2E)
 	tunnel.Proxy(stream, upstream)
+}
+
+func (a *Agent) tunnelMode(name string) protocol.TunnelType {
+	for _, t := range a.cfg.Tunnels {
+		if t.Name == name {
+			return protocol.TunnelType(t.Type)
+		}
+	}
+	return protocol.TunnelTCP
 }
 
 func (a *Agent) localAddrFor(name string) string {
