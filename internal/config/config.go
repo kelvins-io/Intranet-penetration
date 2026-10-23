@@ -54,13 +54,15 @@ type ServerConfig struct {
 	AutoTLS       bool          `yaml:"auto_tls"`
 	EdgeID        string        `yaml:"edge_id"`
 	Region        string        `yaml:"region"`
-	EnableE2E     bool          `yaml:"enable_e2e"` // backhaul AEAD Edge↔Agent
-	ResumeTTL     time.Duration `yaml:"resume_ttl"`
-	Regions       []RegionPeer  `yaml:"regions"` // multi-region directory
-	Cluster       ClusterConfig `yaml:"cluster"`
-	OIDC          OIDCConfig    `yaml:"oidc"`
-	ReadTimeout   time.Duration `yaml:"read_timeout"`
-	WriteTimeout  time.Duration `yaml:"write_timeout"`
+	EnableE2E         bool          `yaml:"enable_e2e"` // backhaul AEAD Edge↔Agent
+	AgentMTLS         string        `yaml:"agent_mtls"` // off | optional | require
+	AccessDefaultDeny bool          `yaml:"access_default_deny"`
+	ResumeTTL         time.Duration `yaml:"resume_ttl"`
+	Regions           []RegionPeer  `yaml:"regions"` // multi-region directory
+	Cluster           ClusterConfig `yaml:"cluster"`
+	OIDC              OIDCConfig    `yaml:"oidc"`
+	ReadTimeout       time.Duration `yaml:"read_timeout"`
+	WriteTimeout      time.Duration `yaml:"write_timeout"`
 }
 
 type AgentTunnel struct {
@@ -71,17 +73,27 @@ type AgentTunnel struct {
 	Domain     string `yaml:"domain"`
 }
 
+type AgentMTLSConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	CAFile   string `yaml:"ca_file"`
+	// InsecureSkipVerify only when CA not provided (dev).
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+}
+
 type AgentConfig struct {
-	ServerAddr      string        `yaml:"server_addr"`
-	QUICAddr        string        `yaml:"quic_addr"`
-	PreferQUIC      bool          `yaml:"prefer_quic"`
-	PreferE2E       bool          `yaml:"prefer_e2e"`
-	Region          string        `yaml:"region"`
-	Token           string        `yaml:"token"`
-	AgentID         string        `yaml:"agent_id"`
-	Tunnels         []AgentTunnel `yaml:"tunnels"`
-	Reconnect       time.Duration `yaml:"reconnect"`
-	ResumeTokenFile string        `yaml:"resume_token_file"`
+	ServerAddr      string          `yaml:"server_addr"`
+	QUICAddr        string          `yaml:"quic_addr"`
+	PreferQUIC      bool            `yaml:"prefer_quic"`
+	PreferE2E       bool            `yaml:"prefer_e2e"`
+	Region          string          `yaml:"region"`
+	Token           string          `yaml:"token"`
+	AgentID         string          `yaml:"agent_id"`
+	Tunnels         []AgentTunnel   `yaml:"tunnels"`
+	Reconnect       time.Duration   `yaml:"reconnect"`
+	ResumeTokenFile string          `yaml:"resume_token_file"`
+	MTLS            AgentMTLSConfig `yaml:"mtls"`
 }
 
 func LoadServer(path string) (*ServerConfig, error) {
@@ -100,8 +112,10 @@ func LoadServer(path string) (*ServerConfig, error) {
 		AutoTLS:       true,
 		EdgeID:        "edge-1",
 		Region:        "local",
-		EnableE2E:     true,
-		ResumeTTL:     5 * time.Minute,
+		EnableE2E:         true,
+		AgentMTLS:         "off",
+		AccessDefaultDeny: false,
+		ResumeTTL:         5 * time.Minute,
 		ReadTimeout:   30 * time.Second,
 		WriteTimeout:  30 * time.Second,
 	}
@@ -122,6 +136,14 @@ func LoadServer(path string) (*ServerConfig, error) {
 	}
 	if cfg.Region == "" {
 		cfg.Region = "local"
+	}
+	switch cfg.AgentMTLS {
+	case "", "off", "optional", "require":
+		if cfg.AgentMTLS == "" {
+			cfg.AgentMTLS = "off"
+		}
+	default:
+		return nil, fmt.Errorf("agent_mtls must be off|optional|require")
 	}
 	if cfg.Cluster.AdvertiseHTTP == "" {
 		cfg.Cluster.AdvertiseHTTP = "http://127.0.0.1" + normalizeListen(cfg.HTTPGateway)

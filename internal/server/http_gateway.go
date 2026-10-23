@@ -45,6 +45,9 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tunnel not found; use /{tenant}/{tunnel}/... or Host {tunnel}.{tenant}."+s.cfg.BaseDomain, http.StatusNotFound)
 		return
 	}
+	if !s.enforceAccess(w, r, tenantID, name, "http.access") {
+		return
+	}
 
 	// Local agent session?
 	if route, exists := s.registry.Get(tenantID, name); exists && route.Type == protocol.TunnelHTTP {

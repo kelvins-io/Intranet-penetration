@@ -7,6 +7,11 @@ token: "dev-token-change-me"
 agent_id: "deploy-agent"
 reconnect: 3s
 resume_token_file: "data/agent_resume.token"
+mtls:
+  enabled: false
+  ca_file: "data/agent/ca.crt"
+  cert_file: "data/agent/agent.crt"
+  key_file: "data/agent/agent.key"
 tunnels:
   - name: demo
     type: http

@@ -73,10 +73,41 @@ type AuditEvent struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// AccessPolicy controls who can reach which tunnels.
+// Subjects: anyone | authenticated | email:<addr> | role:<admin|member>
+// Tunnels: exact name or "*"
+// Actions: http.access | tcp.access | "*"
+type AccessPolicy struct {
+	ID          string    `json:"id"`
+	TenantID    string    `json:"tenant_id"`
+	Name        string    `json:"name"`
+	Enabled     bool      `json:"enabled"`
+	Priority    int       `json:"priority"`
+	Effect      string    `json:"effect"` // allow | deny
+	Subjects    []string  `json:"subjects"`
+	Tunnels     []string  `json:"tunnels"`
+	Actions     []string  `json:"actions"`
+	SourceCIDRs []string  `json:"source_cidrs,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// AgentCert is metadata for an issued mTLS client certificate.
+type AgentCert struct {
+	ID        string    `json:"id"`
+	TenantID  string    `json:"tenant_id"`
+	AgentID   string    `json:"agent_id"`
+	Serial    string    `json:"serial"`
+	NotAfter  time.Time `json:"not_after"`
+	Revoked   bool      `json:"revoked"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type Snapshot struct {
 	Tenants     []Tenant       `json:"tenants"`
 	Users       []User         `json:"users"`
 	AgentTokens []AgentToken   `json:"agent_tokens"`
 	Tunnels     []TunnelRecord `json:"tunnels"`
 	Audits      []AuditEvent   `json:"audits"`
+	Policies    []AccessPolicy `json:"policies"`
+	AgentCerts  []AgentCert    `json:"agent_certs"`
 }

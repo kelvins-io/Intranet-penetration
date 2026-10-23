@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
+	"github.com/kelvins-io/Intranet-penetration/internal/tlsutil"
 	"github.com/kelvins-io/Intranet-penetration/internal/tunnel"
 )
 
@@ -19,6 +21,7 @@ type Agent struct {
 	cfg         *config.AgentConfig
 	log         *slog.Logger
 	resumeToken string
+	tlsConf     *tls.Config
 }
 
 func New(cfg *config.AgentConfig, log *slog.Logger) *Agent {
@@ -27,6 +30,27 @@ func New(cfg *config.AgentConfig, log *slog.Logger) *Agent {
 	}
 	a := &Agent{cfg: cfg, log: log}
 	a.resumeToken = a.loadResumeToken()
+	if cfg.MTLS.Enabled {
+		tc, err := tlsutil.ClientMTLSConfig(
+			cfg.MTLS.CAFile,
+			cfg.MTLS.CertFile,
+			cfg.MTLS.KeyFile,
+			cfg.MTLS.InsecureSkipVerify,
+		)
+		if err != nil {
+			log.Error("load mtls config", "err", err)
+		} else {
+			a.tlsConf = tc
+		}
+	} else if cfg.MTLS.CAFile != "" {
+		// TLS to server without client certificate (agent_mtls=optional).
+		tc, err := tlsutil.ClientMTLSConfig(cfg.MTLS.CAFile, "", "", cfg.MTLS.InsecureSkipVerify)
+		if err != nil {
+			log.Error("load tls config", "err", err)
+		} else {
+			a.tlsConf = tc
+		}
+	}
 	return a
 }
 
@@ -55,7 +79,7 @@ func (a *Agent) connectOnce(ctx context.Context) error {
 		return err
 	}
 	defer sess.Close()
-	a.log.Info("connected", "transport", transport)
+	a.log.Info("connected", "transport", transport, "mtls", a.tlsConf != nil)
 
 	hello := protocol.Hello{
 		Version:     protocol.Version,
@@ -114,7 +138,11 @@ func (a *Agent) dial(ctx context.Context) (*tunnel.Session, string, error) {
 	tryQUIC := a.cfg.PreferQUIC
 	if tryQUIC {
 		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		sess, err := tunnel.ClientQUICSession(qctx, a.cfg.QUICAddr, nil)
+		qTLS := a.tlsConf
+		if qTLS == nil {
+			qTLS = &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"ip-tunnel"}}
+		}
+		sess, err := tunnel.ClientQUICSession(qctx, a.cfg.QUICAddr, qTLS)
 		cancel()
 		if err == nil {
 			return sess, "quic", nil
@@ -123,14 +151,26 @@ func (a *Agent) dial(ctx context.Context) (*tunnel.Session, string, error) {
 	}
 
 	d := net.Dialer{Timeout: 10 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", a.cfg.ServerAddr)
+	raw, err := d.DialContext(ctx, "tcp", a.cfg.ServerAddr)
 	if err != nil {
 		return nil, "", fmt.Errorf("dial tcp: %w", err)
+	}
+	var conn net.Conn = raw
+	if a.tlsConf != nil {
+		tc := tls.Client(raw, a.tlsConf)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, "", fmt.Errorf("tls handshake: %w", err)
+		}
+		conn = tc
 	}
 	sess, err := tunnel.ClientSession(conn)
 	if err != nil {
 		_ = conn.Close()
 		return nil, "", err
+	}
+	if a.tlsConf != nil {
+		return sess, "tcp+tls", nil
 	}
 	return sess, "tcp", nil
 }

@@ -54,7 +54,7 @@
     }
     .pill.on { color: var(--ok); border-color: #245c44; }
     .pill.off { color: var(--muted); }
-    input, button {
+    input, button, select {
       background: #121820;
       color: var(--text);
       border: 1px solid var(--line);
@@ -147,6 +147,42 @@
         <p class="muted" id="slaHint" style="margin-top:12px"></p>
       </section>
       <section class="card">
+        <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2>Access Policy</h2>
+          <div class="row">
+            <input id="polName" placeholder="策略名" style="width:100px" />
+            <select id="polEffect"><option value="allow">allow</option><option value="deny">deny</option></select>
+            <input id="polPriority" placeholder="优先级" value="100" style="width:70px" />
+            <input id="polSubjects" placeholder="subjects" value="anyone" style="width:120px" />
+            <input id="polTunnels" placeholder="tunnels" value="*" style="width:80px" />
+            <input id="polActions" placeholder="actions" value="*" style="width:100px" />
+            <input id="polCIDRs" placeholder="CIDR 可选" style="width:120px" />
+            <button id="btnPolicy">创建</button>
+          </div>
+        </div>
+        <p class="muted">subjects: anyone | authenticated | email:x | role:admin；actions: http.access | tcp.access | *</p>
+        <table>
+          <thead><tr><th>名称</th><th>效果</th><th>优先级</th><th>主体</th><th>隧道</th><th>动作</th><th>状态</th><th></th></tr></thead>
+          <tbody id="policies"></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+          <h2>Agent mTLS 证书</h2>
+          <div class="row">
+            <input id="certAgent" placeholder="agent_id" value="dev-agent" style="width:140px" />
+            <input id="certTTL" placeholder="TTL 天" value="365" style="width:70px" />
+            <button id="btnCert">签发</button>
+            <button class="secondary" id="btnCA">下载 CA</button>
+          </div>
+        </div>
+        <pre id="certOut" class="muted" style="white-space:pre-wrap;max-height:160px;overflow:auto;margin:0 0 12px"></pre>
+        <table>
+          <thead><tr><th>Agent</th><th>Serial</th><th>过期</th><th>状态</th><th></th></tr></thead>
+          <tbody id="certs"></tbody>
+        </table>
+      </section>
+      <section class="card">
         <h2>审计日志</h2>
         <table>
           <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>详情</th></tr></thead>
@@ -215,7 +251,7 @@
       document.getElementById('stats').innerHTML = [
         ['在线 Agent', stats.online_agents],
         ['Region', stats.region || '-'],
-        ['E2E', stats.e2e_enabled ? 'on' : 'off'],
+        ['Agent mTLS', stats.agent_mtls || 'off'],
         ['可用性%', (stats.sla && stats.sla.availability_pct != null) ? stats.sla.availability_pct.toFixed(2) : '-'],
       ].map(([l, v]) => `<div class="card"><div class="label">${l}</div><div class="value">${v}</div></div>`).join('');
 
@@ -255,6 +291,32 @@
           <td>${t.revoked ? 'revoked' : 'active'}</td>
           <td class="muted">${new Date(t.created_at).toLocaleString()}</td>
         </tr>`).join('');
+
+      const policies = await api('/api/v1/policies');
+      document.getElementById('policies').innerHTML = policies.map(p => `
+        <tr>
+          <td>${p.name}</td>
+          <td>${p.effect}</td>
+          <td>${p.priority}</td>
+          <td class="muted">${(p.subjects||[]).join(', ')}</td>
+          <td class="muted">${(p.tunnels||[]).join(', ')}</td>
+          <td class="muted">${(p.actions||[]).join(', ')}</td>
+          <td><span class="pill ${p.enabled ? 'on' : 'off'}">${p.enabled ? 'on' : 'off'}</span></td>
+          <td class="row">
+            <button class="secondary" data-pol-toggle="${p.id}" data-on="${p.enabled}">${p.enabled ? '禁用' : '启用'}</button>
+            <button class="secondary" data-pol-del="${p.id}">删除</button>
+          </td>
+        </tr>`).join('') || '<tr><td colspan="8" class="muted">暂无策略（默认放行，除非 access_default_deny）</td></tr>';
+
+      const certs = await api('/api/v1/certs');
+      document.getElementById('certs').innerHTML = certs.map(c => `
+        <tr>
+          <td><code>${c.agent_id}</code></td>
+          <td class="muted">${c.serial}</td>
+          <td class="muted">${c.not_after ? new Date(c.not_after).toLocaleDateString() : '-'}</td>
+          <td>${c.revoked ? 'revoked' : 'active'}</td>
+          <td>${c.revoked ? '' : `<button class="secondary" data-cert-rev="${c.id}">吊销</button>`}</td>
+        </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无证书</td></tr>';
 
       const audits = await api('/api/v1/audit?limit=30');
       document.getElementById('audits').innerHTML = audits.map(a => `
@@ -305,6 +367,66 @@
       a.href = URL.createObjectURL(blob);
       a.download = 'compliance-export.json';
       a.click();
+    };
+    document.getElementById('btnPolicy').onclick = async () => {
+      const split = (s) => s.split(/[, ]+/).map(x => x.trim()).filter(Boolean);
+      await api('/api/v1/policies', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: document.getElementById('polName').value || 'policy',
+          effect: document.getElementById('polEffect').value,
+          priority: parseInt(document.getElementById('polPriority').value || '100', 10),
+          subjects: split(document.getElementById('polSubjects').value),
+          tunnels: split(document.getElementById('polTunnels').value),
+          actions: split(document.getElementById('polActions').value),
+          source_cidrs: split(document.getElementById('polCIDRs').value),
+        }),
+      });
+      await refresh();
+    };
+    document.getElementById('btnCert').onclick = async () => {
+      const out = await api('/api/v1/certs', {
+        method: 'POST',
+        body: JSON.stringify({
+          agent_id: document.getElementById('certAgent').value,
+          ttl_days: parseInt(document.getElementById('certTTL').value || '365', 10),
+        }),
+      });
+      document.getElementById('certOut').textContent =
+        '# 保存到 agent 配置目录后启用 mtls.enabled\n' +
+        '# ca.crt / agent.crt / agent.key\n\n' +
+        out.ca_pem + '\n' + out.cert_pem + '\n' + out.key_pem;
+      await refresh();
+    };
+    document.getElementById('btnCA').onclick = async () => {
+      const res = await fetch('/api/v1/certs/ca', { headers: { Authorization: 'Bearer ' + state.key } });
+      if (!res.ok) { alert('CA 不可用（agent_mtls=off？）'); return; }
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'ca.crt';
+      a.click();
+    };
+    document.getElementById('policies').onclick = async (ev) => {
+      const t = ev.target;
+      if (t.dataset.polDel) {
+        await api('/api/v1/policies?id=' + encodeURIComponent(t.dataset.polDel), { method: 'DELETE' });
+        await refresh();
+      }
+      if (t.dataset.polToggle) {
+        const on = t.dataset.on === 'true';
+        await api('/api/v1/policies?id=' + encodeURIComponent(t.dataset.polToggle), {
+          method: 'PATCH',
+          body: JSON.stringify({ enabled: !on }),
+        });
+        await refresh();
+      }
+    };
+    document.getElementById('certs').onclick = async (ev) => {
+      const id = ev.target.dataset.certRev;
+      if (!id) return;
+      await api('/api/v1/certs?id=' + encodeURIComponent(id), { method: 'DELETE' });
+      await refresh();
     };
     document.getElementById('btnOIDC').onclick = () => {
       location.href = '/api/v1/auth/oidc/login';

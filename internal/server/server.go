@@ -24,15 +24,17 @@ import (
 )
 
 type Server struct {
-	cfg      *config.ServerConfig
-	registry *Registry
-	store    *store.Store
-	cluster  cluster.Registry
-	resume   *resume.Store
-	oidc     *authoidc.Provider
-	tlsConf  *tls.Config
-	metrics  *metrics.Collector
-	log      *slog.Logger
+	cfg       *config.ServerConfig
+	registry  *Registry
+	store     *store.Store
+	cluster   cluster.Registry
+	resume    *resume.Store
+	oidc      *authoidc.Provider
+	tlsConf   *tls.Config // public HTTPS / base
+	agentTLS  *tls.Config // agent mux (may require client certs)
+	ca        *tlsutil.CA
+	metrics   *metrics.Collector
+	log       *slog.Logger
 
 	mu        sync.Mutex
 	tcpStops  map[string]context.CancelFunc
@@ -72,7 +74,13 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("oidc: %w", err)
 	}
 
-	needTLS := cfg.AutoTLS || cfg.QUICListen != "" || cfg.HTTPSGateway != ""
+	mtlsMode := cfg.AgentMTLS
+	if mtlsMode == "" {
+		mtlsMode = "off"
+	}
+	cfg.AgentMTLS = mtlsMode
+
+	needTLS := cfg.AutoTLS || cfg.QUICListen != "" || cfg.HTTPSGateway != "" || mtlsMode != "off"
 	var tlsConf *tls.Config
 	if needTLS {
 		tlsConf, err = tlsutil.LoadOrGenerate(
@@ -86,6 +94,17 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 		}
 	}
 
+	var ca *tlsutil.CA
+	var agentTLS *tls.Config
+	if mtlsMode != "off" {
+		ca, err = tlsutil.LoadOrCreateCA(cfg.DataDir)
+		if err != nil {
+			return nil, fmt.Errorf("ca: %w", err)
+		}
+		agentTLS = tlsutil.ServerMTLSConfig(tlsConf, ca, mtlsMode)
+		log.Info("agent mTLS", "mode", mtlsMode)
+	}
+
 	return &Server{
 		cfg:      cfg,
 		registry: NewRegistry(),
@@ -94,6 +113,8 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 		resume:   resume.New(cfg.ResumeTTL),
 		oidc:     oidcProv,
 		tlsConf:  tlsConf,
+		agentTLS: agentTLS,
+		ca:       ca,
 		metrics:  metrics.New(),
 		log:      log,
 		tcpStops: make(map[string]context.CancelFunc),
@@ -101,18 +122,28 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	agentLn, err := net.Listen("tcp", s.cfg.Listen)
+	rawAgentLn, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen agent tcp: %w", err)
 	}
+	var agentLn net.Listener = rawAgentLn
+	if s.agentTLS != nil {
+		agentLn = tls.NewListener(rawAgentLn, s.agentTLS)
+		s.log.Info("agent mux listening", "transport", "tcp+tls", "mtls", s.cfg.AgentMTLS, "addr", agentLn.Addr().String())
+	} else {
+		s.log.Info("agent mux listening", "transport", "tcp", "addr", agentLn.Addr().String())
+	}
 	s.trackListener(agentLn)
-	s.log.Info("agent mux listening", "transport", "tcp", "addr", agentLn.Addr().String())
 
 	if s.cfg.QUICListen != "" {
-		if s.tlsConf == nil {
+		qTLS := s.tlsConf
+		if s.agentTLS != nil {
+			qTLS = s.agentTLS
+		}
+		if qTLS == nil {
 			return fmt.Errorf("quic requires tls config")
 		}
-		qln, err := tunnel.ListenQUIC(s.cfg.QUICListen, s.tlsConf)
+		qln, err := tunnel.ListenQUIC(s.cfg.QUICListen, qTLS)
 		if err != nil {
 			return fmt.Errorf("listen agent quic: %w", err)
 		}
@@ -154,6 +185,8 @@ func (s *Server) Run(ctx context.Context) error {
 		"edge_id", s.cfg.EdgeID,
 		"region", s.cfg.Region,
 		"e2e", s.cfg.EnableE2E,
+		"agent_mtls", s.cfg.AgentMTLS,
+		"access_default_deny", s.cfg.AccessDefaultDeny,
 		"dashboard", fmt.Sprintf("http://%s/dashboard/", s.httpAdvertiseHost()),
 		"oidc", s.oidc != nil,
 		"admin_api_key_hint", maskKey(s.store.AdminAPIKey()),
@@ -196,33 +229,83 @@ func (s *Server) serveQUIC(ctx context.Context, ln *quic.Listener) {
 
 func (s *Server) handleAgentTCP(ctx context.Context, conn net.Conn) {
 	remote := conn.RemoteAddr().String()
-	s.log.Info("agent connected", "remote", remote, "transport", "tcp")
+	peerCN := ""
+	if tc, ok := conn.(*tls.Conn); ok {
+		if err := tc.Handshake(); err != nil {
+			s.log.Warn("agent tls handshake", "err", err, "remote", remote)
+			_ = conn.Close()
+			return
+		}
+		peerCN = tlsutil.PeerAgentID(tc.ConnectionState())
+		if s.cfg.AgentMTLS == "require" && peerCN == "" {
+			s.log.Warn("agent mTLS required but no client cert", "remote", remote)
+			_ = conn.Close()
+			return
+		}
+		if st := tc.ConnectionState(); len(st.PeerCertificates) > 0 {
+			serial := st.PeerCertificates[0].SerialNumber.Text(16)
+			if s.store.IsAgentCertRevoked(serial) {
+				s.log.Warn("agent cert revoked", "serial", serial, "remote", remote)
+				_ = conn.Close()
+				return
+			}
+		}
+	} else if s.cfg.AgentMTLS == "require" {
+		s.log.Warn("agent mTLS required but connection is plaintext", "remote", remote)
+		_ = conn.Close()
+		return
+	}
+	s.log.Info("agent connected", "remote", remote, "transport", "tcp", "peer_cn", peerCN)
 	defer conn.Close()
 	sess, err := tunnel.ServerSession(conn)
 	if err != nil {
 		s.log.Debug("yamux server", "err", err, "remote", remote)
 		return
 	}
-	s.serveAgentSession(ctx, sess, remote)
+	s.serveAgentSession(ctx, sess, remote, peerCN)
 }
 
 func (s *Server) handleAgentQUIC(ctx context.Context, conn *quic.Conn) {
 	remote := conn.RemoteAddr().String()
-	s.log.Info("agent connected", "remote", remote, "transport", "quic")
+	peerCN := ""
+	if st := conn.ConnectionState().TLS; len(st.PeerCertificates) > 0 {
+		peerCN = st.PeerCertificates[0].Subject.CommonName
+		serial := st.PeerCertificates[0].SerialNumber.Text(16)
+		if s.store.IsAgentCertRevoked(serial) {
+			s.log.Warn("agent cert revoked", "serial", serial, "remote", remote)
+			_ = conn.CloseWithError(1, "revoked")
+			return
+		}
+	} else if s.cfg.AgentMTLS == "require" {
+		s.log.Warn("agent mTLS required but no client cert on quic", "remote", remote)
+		_ = conn.CloseWithError(1, "mtls required")
+		return
+	}
+	s.log.Info("agent connected", "remote", remote, "transport", "quic", "peer_cn", peerCN)
 	defer conn.CloseWithError(0, "done")
 	sess, err := tunnel.ServerQUICSession(conn)
 	if err != nil {
 		s.log.Debug("quic session", "err", err, "remote", remote)
 		return
 	}
-	s.serveAgentSession(ctx, sess, remote)
+	s.serveAgentSession(ctx, sess, remote, peerCN)
 }
 
-func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, remote string) {
+func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, remote, peerCN string) {
 	defer sess.Close()
 
 	var tenant *store.Tenant
 	hello, ack, err := sess.HandshakeAsServer(func(h protocol.Hello) (*protocol.HelloAck, error) {
+		if s.cfg.AgentMTLS == "require" {
+			if peerCN == "" {
+				return nil, fmt.Errorf("client certificate required")
+			}
+			if peerCN != h.AgentID {
+				return nil, fmt.Errorf("certificate CN %q does not match agent_id %q", peerCN, h.AgentID)
+			}
+		} else if peerCN != "" && peerCN != h.AgentID {
+			return nil, fmt.Errorf("certificate CN %q does not match agent_id %q", peerCN, h.AgentID)
+		}
 		a, t, err := s.validateHello(h)
 		if err != nil {
 			return nil, err

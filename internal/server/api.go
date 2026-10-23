@@ -34,6 +34,9 @@ func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/regions", s.withAuth(s.handleRegions))
 	mux.HandleFunc("/api/v1/sla/report", s.withAuth(s.handleSLAReport))
 	mux.HandleFunc("/api/v1/compliance/export", s.withAuth(s.handleComplianceExport))
+	mux.HandleFunc("/api/v1/policies", s.withAuth(s.handlePolicies))
+	mux.HandleFunc("/api/v1/certs", s.withAuth(s.handleCerts))
+	mux.HandleFunc("/api/v1/certs/ca", s.withAuth(s.handleCACert))
 	// backward compatible
 	mux.HandleFunc("/api/tunnels", s.handleLegacyTunnels)
 }
@@ -236,9 +239,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request, au *apiUser
 		"quota":         au.Tenant.Quota,
 		"edge_id":       s.cfg.EdgeID,
 		"region":        s.cfg.Region,
-		"e2e_enabled":   s.cfg.EnableE2E,
-		"oidc_enabled":  s.oidc != nil,
-		"sla":           snap,
+		"e2e_enabled":         s.cfg.EnableE2E,
+		"oidc_enabled":        s.oidc != nil,
+		"agent_mtls":          s.cfg.AgentMTLS,
+		"access_default_deny": s.cfg.AccessDefaultDeny,
+		"sla":                 snap,
 	})
 }
 
@@ -313,6 +318,10 @@ func (s *Server) handleComplianceExport(w http.ResponseWriter, r *http.Request, 
 		"audits":      s.store.ListAudits(tenantID, 1000),
 		"users":       s.store.ListUsers(tenantID),
 		"tokens":      s.store.ListAgentTokens(tenantID),
+		"policies":    s.store.ListPolicies(tenantID),
+		"agent_certs": s.store.ListAgentCerts(tenantID),
+		"agent_mtls":  s.cfg.AgentMTLS,
+		"access_default_deny": s.cfg.AccessDefaultDeny,
 		"sla":         s.metrics.Snapshot(),
 		"region":      s.cfg.Region,
 		"edge_id":     s.cfg.EdgeID,
@@ -387,6 +396,172 @@ func randomState() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+func (s *Server) handlePolicies(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.ListPolicies(au.Tenant.ID))
+	case http.MethodPost:
+		var body struct {
+			Name        string   `json:"name"`
+			Enabled     *bool    `json:"enabled"`
+			Priority    int      `json:"priority"`
+			Effect      string   `json:"effect"`
+			Subjects    []string `json:"subjects"`
+			Tunnels     []string `json:"tunnels"`
+			Actions     []string `json:"actions"`
+			SourceCIDRs []string `json:"source_cidrs"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		enabled := true
+		if body.Enabled != nil {
+			enabled = *body.Enabled
+		}
+		p, err := s.store.CreatePolicy(store.AccessPolicy{
+			TenantID:    au.Tenant.ID,
+			Name:        body.Name,
+			Enabled:     enabled,
+			Priority:    body.Priority,
+			Effect:      body.Effect,
+			Subjects:    body.Subjects,
+			Tunnels:     body.Tunnels,
+			Actions:     body.Actions,
+			SourceCIDRs: body.SourceCIDRs,
+		})
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "policy.create", p.ID, p.Name)
+		writeJSON(w, http.StatusCreated, p)
+	case http.MethodPatch:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "id required")
+			return
+		}
+		var body struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Enabled == nil {
+			writeErr(w, http.StatusBadRequest, "enabled required")
+			return
+		}
+		p, err := s.store.SetPolicyEnabled(id, *body.Enabled)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "policy.update", p.ID, strconv.FormatBool(p.Enabled))
+		writeJSON(w, http.StatusOK, p)
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "id required")
+			return
+		}
+		if err := s.store.DeletePolicy(id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "policy.delete", id, "")
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleCerts(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.ListAgentCerts(au.Tenant.ID))
+	case http.MethodPost:
+		if s.ca == nil {
+			writeErr(w, http.StatusServiceUnavailable, "agent mtls disabled (agent_mtls=off)")
+			return
+		}
+		var body struct {
+			AgentID string `json:"agent_id"`
+			TTLDays int    `json:"ttl_days"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.AgentID == "" {
+			writeErr(w, http.StatusBadRequest, "agent_id required")
+			return
+		}
+		ttl := time.Duration(body.TTLDays) * 24 * time.Hour
+		if body.TTLDays <= 0 {
+			ttl = 365 * 24 * time.Hour
+		}
+		certPEM, keyPEM, serial, notAfter, err := s.ca.IssueAgentCert(body.AgentID, au.Tenant.ID, ttl)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		rec := store.AgentCert{
+			TenantID: au.Tenant.ID,
+			AgentID:  body.AgentID,
+			Serial:   serial,
+			NotAfter: notAfter,
+		}
+		if err := s.store.RecordAgentCert(rec); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "cert.issue", body.AgentID, serial)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"agent_id":  body.AgentID,
+			"serial":    serial,
+			"not_after": notAfter,
+			"cert_pem":  string(certPEM),
+			"key_pem":   string(keyPEM),
+			"ca_pem":    string(s.ca.CertPEM),
+		})
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "id required")
+			return
+		}
+		if err := s.store.RevokeAgentCert(id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeErr(w, http.StatusNotFound, "not found")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "cert.revoke", id, "")
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleCACert(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.ca == nil {
+		writeErr(w, http.StatusServiceUnavailable, "agent mtls disabled")
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Header().Set("Content-Disposition", "attachment; filename=ca.crt")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(s.ca.CertPEM)
 }
 
 func (s *Server) handleLegacyTunnels(w http.ResponseWriter, r *http.Request) {

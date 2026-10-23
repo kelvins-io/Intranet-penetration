@@ -680,3 +680,118 @@ func (s *Store) DefaultAgentToken() string {
 func RouteKey(tenantID, name string) string {
 	return routeKey(tenantID, name)
 }
+
+func (s *Store) ListPolicies(tenantID string) []AccessPolicy {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []AccessPolicy{}
+	for _, p := range s.data.Policies {
+		if tenantID == "" || p.TenantID == tenantID {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (s *Store) CreatePolicy(p AccessPolicy) (*AccessPolicy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.TenantID == "" || p.Name == "" {
+		return nil, fmt.Errorf("tenant_id and name required")
+	}
+	if p.Effect != "allow" && p.Effect != "deny" {
+		return nil, fmt.Errorf("effect must be allow or deny")
+	}
+	if p.ID == "" {
+		p.ID = NewID("pol")
+	}
+	if len(p.Subjects) == 0 {
+		p.Subjects = []string{"anyone"}
+	}
+	if len(p.Tunnels) == 0 {
+		p.Tunnels = []string{"*"}
+	}
+	if len(p.Actions) == 0 {
+		p.Actions = []string{"*"}
+	}
+	p.CreatedAt = time.Now().UTC()
+	s.data.Policies = append(s.data.Policies, p)
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (s *Store) DeletePolicy(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, p := range s.data.Policies {
+		if p.ID == id {
+			s.data.Policies = append(s.data.Policies[:i], s.data.Policies[i+1:]...)
+			return s.persistLocked()
+		}
+	}
+	return ErrNotFound
+}
+
+func (s *Store) SetPolicyEnabled(id string, enabled bool) (*AccessPolicy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Policies {
+		if s.data.Policies[i].ID == id {
+			s.data.Policies[i].Enabled = enabled
+			if err := s.persistLocked(); err != nil {
+				return nil, err
+			}
+			cp := s.data.Policies[i]
+			return &cp, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (s *Store) RecordAgentCert(c AgentCert) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c.ID == "" {
+		c.ID = NewID("crt")
+	}
+	c.CreatedAt = time.Now().UTC()
+	s.data.AgentCerts = append(s.data.AgentCerts, c)
+	return s.persistLocked()
+}
+
+func (s *Store) ListAgentCerts(tenantID string) []AgentCert {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []AgentCert{}
+	for _, c := range s.data.AgentCerts {
+		if tenantID == "" || c.TenantID == tenantID {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func (s *Store) RevokeAgentCert(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.AgentCerts {
+		if s.data.AgentCerts[i].ID == id {
+			s.data.AgentCerts[i].Revoked = true
+			return s.persistLocked()
+		}
+	}
+	return ErrNotFound
+}
+
+func (s *Store) IsAgentCertRevoked(serial string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, c := range s.data.AgentCerts {
+		if c.Serial == serial && c.Revoked {
+			return true
+		}
+	}
+	return false
+}

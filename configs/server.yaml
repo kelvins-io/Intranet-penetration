@@ -9,6 +9,10 @@ data_dir: "data"
 edge_id: "edge-1"
 region: "local"
 enable_e2e: true
+# off | optional | require — Agent 控制面 mTLS（optional/require 时 Agent 须走 TLS）
+agent_mtls: "off"
+# 无匹配策略时是否默认拒绝公网访问
+access_default_deny: false
 resume_ttl: 5m
 admin_email: "admin@localhost"
 admin_password: "admin123"

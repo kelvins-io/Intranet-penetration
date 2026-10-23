@@ -7,6 +7,13 @@ token: "dev-token-change-me"
 agent_id: "dev-agent"
 reconnect: 3s
 resume_token_file: "data/agent_resume.token"
+# 启用前先通过 Dashboard / API 签发证书
+mtls:
+  enabled: false
+  ca_file: "data/agent/ca.crt"
+  cert_file: "data/agent/agent.crt"
+  key_file: "data/agent/agent.key"
+  insecure_skip_verify: false
 tunnels:
   - name: demo
     type: http

@@ -9,6 +9,8 @@ data_dir: "data"
 edge_id: "edge-1"
 region: "cn-east"
 enable_e2e: true
+agent_mtls: "off"
+access_default_deny: false
 resume_ttl: 5m
 admin_email: "admin@localhost"
 admin_password: "admin123"

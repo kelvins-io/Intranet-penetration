@@ -52,6 +52,10 @@ func (s *Server) startTCPListener(ctx context.Context, routeKey string, port int
 
 func (s *Server) handleTCPConn(tenantID, tunnelName string, client net.Conn) {
 	defer client.Close()
+	if err := s.enforceTCPAccess(tenantID, tunnelName, client.RemoteAddr().String()); err != nil {
+		s.log.Warn("tcp access denied", "tunnel", tunnelName, "remote", client.RemoteAddr().String())
+		return
+	}
 	stream, err := s.registry.OpenToAgent(tenantID, tunnelName, client.RemoteAddr().String())
 	if err != nil {
 		s.log.Warn("open agent stream", "tunnel", tunnelName, "err", err)
