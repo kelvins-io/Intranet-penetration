@@ -1,4 +1,4 @@
-.PHONY: build run-server run-control run-edge run-agent run-demo test tidy private-up private-down
+.PHONY: build run-server run-control run-edge run-agent run-demo test tidy vet ci private-up private-down
 
 build:
 	go build -o bin/server ./cmd/server
@@ -10,8 +10,13 @@ build:
 tidy:
 	go mod tidy
 
+vet:
+	go vet ./...
+
 test:
-	go test ./...
+	go test ./... -count=1
+
+ci: vet test build
 
 run-server:
 	go run ./cmd/server -config configs/server.yaml

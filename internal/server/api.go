@@ -32,6 +32,7 @@ func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/stats", s.withAuth(s.handleStats))
 	mux.HandleFunc("/api/v1/cluster", s.withAuth(s.handleCluster))
 	mux.HandleFunc("/api/v1/regions", s.withAuth(s.handleRegions))
+	mux.HandleFunc("/api/v1/regions/recommend", s.withAuth(s.handleRegionRecommend))
 	mux.HandleFunc("/api/v1/sla/report", s.withAuth(s.handleSLAReport))
 	mux.HandleFunc("/api/v1/compliance/export", s.withAuth(s.handleComplianceExport))
 	mux.HandleFunc("/api/v1/policies", s.withAuth(s.handlePolicies))
@@ -304,7 +305,8 @@ func (s *Server) handleSLAReport(w http.ResponseWriter, r *http.Request, au *api
 		"generated":   snap.StartedAt,
 		"report":      snap,
 		"target_sla":  "99.95%",
-		"note":        "Availability derived from process uptime; wire synthetic probes for production SLA.",
+		"meets_target": snap.Availability >= 99.95,
+		"note":        "Availability from synthetic /healthz probe rolling window (see availability_source).",
 	})
 }
 
@@ -495,14 +497,15 @@ func (s *Server) handleTrafficPolicies(w http.ResponseWriter, r *http.Request, a
 		writeJSON(w, http.StatusOK, s.store.ListTrafficPolicies(au.Tenant.ID))
 	case http.MethodPost:
 		var body struct {
-			Name          string   `json:"name"`
-			Enabled       *bool    `json:"enabled"`
-			Priority      int      `json:"priority"`
-			Tunnels       []string `json:"tunnels"`
-			Scope         string   `json:"scope"`
-			RateRPS       float64  `json:"rate_rps"`
-			Burst         int      `json:"burst"`
-			MaxConcurrent int      `json:"max_concurrent"`
+			Name             string   `json:"name"`
+			Enabled          *bool    `json:"enabled"`
+			Priority         int      `json:"priority"`
+			Tunnels          []string `json:"tunnels"`
+			Scope            string   `json:"scope"`
+			RateRPS          float64  `json:"rate_rps"`
+			Burst            int      `json:"burst"`
+			MaxConcurrent    int      `json:"max_concurrent"`
+			MaxBandwidthBPS  int64    `json:"max_bandwidth_bps"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid json")
@@ -513,15 +516,16 @@ func (s *Server) handleTrafficPolicies(w http.ResponseWriter, r *http.Request, a
 			enabled = *body.Enabled
 		}
 		p, err := s.store.CreateTrafficPolicy(store.TrafficPolicy{
-			TenantID:      au.Tenant.ID,
-			Name:          body.Name,
-			Enabled:       enabled,
-			Priority:      body.Priority,
-			Tunnels:       body.Tunnels,
-			Scope:         body.Scope,
-			RateRPS:       body.RateRPS,
-			Burst:         body.Burst,
-			MaxConcurrent: body.MaxConcurrent,
+			TenantID:         au.Tenant.ID,
+			Name:             body.Name,
+			Enabled:          enabled,
+			Priority:         body.Priority,
+			Tunnels:          body.Tunnels,
+			Scope:            body.Scope,
+			RateRPS:          body.RateRPS,
+			Burst:            body.Burst,
+			MaxConcurrent:    body.MaxConcurrent,
+			MaxBandwidthBPS:  body.MaxBandwidthBPS,
 		})
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())

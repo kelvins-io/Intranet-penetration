@@ -75,16 +75,17 @@ func (s *Server) enforceAccess(w http.ResponseWriter, r *http.Request, tenantID,
 	return true
 }
 
-// enforceTraffic returns a release func that must be deferred by the caller.
-func (s *Server) enforceTraffic(w http.ResponseWriter, tenantID, tunnel, remoteAddr string) (release func(), ok bool) {
+// enforceTraffic returns a release func that must be deferred by the caller,
+// plus optional bandwidth cap (bytes/sec, 0 = unlimited).
+func (s *Server) enforceTraffic(w http.ResponseWriter, tenantID, tunnel, remoteAddr string) (release func(), bandwidthBPS int64, ok bool) {
 	td := s.limiter.Allow(s.listTrafficPolicies(tenantID), tenantID, tunnel, remoteAddr)
 	if td.Allowed {
-		return td.Release, true
+		return td.Release, td.BandwidthBPS, true
 	}
 	s.auditEvent(tenantID, "public", "traffic.deny", tunnel, td.Reason+" policy="+td.Policy)
 	w.Header().Set("Retry-After", "1")
 	http.Error(w, "too many requests: "+td.Reason, http.StatusTooManyRequests)
-	return func() {}, false
+	return func() {}, 0, false
 }
 
 func (s *Server) enforceTCPAccess(tenantID, tunnel, remoteAddr string) error {
@@ -104,11 +105,11 @@ func (s *Server) enforceTCPAccess(tenantID, tunnel, remoteAddr string) error {
 	return nil
 }
 
-func (s *Server) enforceTCPTraffic(tenantID, tunnel, remoteAddr string) (release func(), err error) {
+func (s *Server) enforceTCPTraffic(tenantID, tunnel, remoteAddr string) (release func(), bandwidthBPS int64, err error) {
 	td := s.limiter.Allow(s.listTrafficPolicies(tenantID), tenantID, tunnel, remoteAddr)
 	if td.Allowed {
-		return td.Release, nil
+		return td.Release, td.BandwidthBPS, nil
 	}
 	s.auditEvent(tenantID, "public", "traffic.deny", tunnel, td.Reason+" policy="+td.Policy)
-	return func() {}, store.ErrUnauthorized
+	return func() {}, 0, store.ErrUnauthorized
 }

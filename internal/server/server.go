@@ -224,6 +224,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	if !s.cfg.IsEdge() {
+		s.startProbeLoop(ctx)
 		s.log.Info("control plane ready",
 			"role", role,
 			"api_listen", s.cfg.APIListen,
@@ -264,11 +265,17 @@ func (s *Server) serveControlAPI(ctx context.Context, ln net.Listener) {
 	mux := http.NewServeMux()
 	s.mountAPI(mux)
 	s.mountDashboard(mux)
+	s.mountAccessClient(mux)
 	s.mountInternalAPI(mux)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		s.metrics.WritePrometheus(w)
+	})
+	mux.HandleFunc("/api/v1/regions/discover", s.handleRegionDiscover)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -340,6 +347,7 @@ func (s *Server) runEdge(ctx context.Context) error {
 
 	_ = s.cluster.Heartbeat(s.cfg.EdgeID, s.cfg.Cluster.AdvertiseHTTP, s.cfg.Region)
 	go s.heartbeatLoop(ctx)
+	s.startProbeLoop(ctx)
 	if s.cfg.IsEdgeOnly() {
 		go s.edgeSyncLoop(ctx)
 	}

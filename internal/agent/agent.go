@@ -3,9 +3,11 @@ package agent
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +76,7 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (a *Agent) connectOnce(ctx context.Context) error {
+	a.maybeDiscover(ctx)
 	sess, transport, err := a.dial(ctx)
 	if err != nil {
 		return err
@@ -136,8 +139,9 @@ func (a *Agent) connectOnce(ctx context.Context) error {
 }
 
 func (a *Agent) dial(ctx context.Context) (*tunnel.Session, string, error) {
-	tryQUIC := a.cfg.PreferQUIC
-	if tryQUIC {
+	var errs []string
+
+	if a.cfg.PreferQUIC {
 		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		qTLS := a.tlsConf
 		if qTLS == nil {
@@ -148,32 +152,144 @@ func (a *Agent) dial(ctx context.Context) (*tunnel.Session, string, error) {
 		if err == nil {
 			return sess, "quic", nil
 		}
+		errs = append(errs, "quic: "+err.Error())
 		a.log.Warn("quic dial failed, fallback tcp", "err", err)
 	}
 
+	if sess, name, err := a.dialTCP(ctx); err == nil {
+		return sess, name, nil
+	} else if err != nil {
+		errs = append(errs, err.Error())
+		a.log.Warn("tcp dial failed", "err", err)
+	}
+
+	if a.cfg.WSAddr != "" && a.cfg.PreferWSFallback {
+		a.log.Info("trying websocket fallback", "addr", a.cfg.WSAddr)
+		sess, err := tunnel.ClientWSSession(ctx, a.cfg.WSAddr, nil)
+		if err == nil {
+			return sess, "websocket", nil
+		}
+		errs = append(errs, "ws: "+err.Error())
+		a.log.Warn("websocket dial failed", "err", err)
+	}
+
+	if len(errs) == 0 {
+		return nil, "", fmt.Errorf("no transport available")
+	}
+	return nil, "", fmt.Errorf("all transports failed: %s", strings.Join(errs, "; "))
+}
+
+func (a *Agent) dialTCP(ctx context.Context) (*tunnel.Session, string, error) {
 	d := net.Dialer{Timeout: 10 * time.Second}
 	raw, err := d.DialContext(ctx, "tcp", a.cfg.ServerAddr)
 	if err != nil {
-		return nil, "", fmt.Errorf("dial tcp: %w", err)
+		return nil, "", fmt.Errorf("tcp: %w", err)
 	}
 	var conn net.Conn = raw
+	name := "tcp"
 	if a.tlsConf != nil {
 		tc := tls.Client(raw, a.tlsConf)
 		if err := tc.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
-			return nil, "", fmt.Errorf("tls handshake: %w", err)
+			return nil, "", fmt.Errorf("tls: %w", err)
 		}
 		conn = tc
+		name = "tcp+tls"
 	}
 	sess, err := tunnel.ClientSession(conn)
 	if err != nil {
 		_ = conn.Close()
-		return nil, "", err
+		return nil, "", fmt.Errorf("yamux: %w", err)
 	}
-	if a.tlsConf != nil {
-		return sess, "tcp+tls", nil
+	return sess, name, nil
+}
+
+func (a *Agent) maybeDiscover(ctx context.Context) {
+	if a.cfg.DiscoverURL == "" {
+		return
 	}
-	return sess, "tcp", nil
+	url := a.cfg.DiscoverURL
+	if a.cfg.Region != "" && !strings.Contains(url, "prefer=") {
+		sep := "?"
+		if strings.Contains(url, "?") {
+			sep = "&"
+		}
+		url = url + sep + "prefer=" + a.cfg.Region
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		a.log.Warn("region discover failed", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		a.log.Warn("region discover bad status", "status", resp.StatusCode)
+		return
+	}
+	var rec struct {
+		Region        string `json:"region"`
+		EdgeID        string `json:"edge_id"`
+		AdvertiseHTTP string `json:"advertise_http"`
+		AgentListen   string `json:"agent_listen"`
+		QUICListen    string `json:"quic_listen"`
+		WSURL         string `json:"ws_url"`
+		Reason        string `json:"reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+		a.log.Warn("region discover decode", "err", err)
+		return
+	}
+	host := hostFromAdvertise(rec.AdvertiseHTTP)
+	if host != "" && rec.AgentListen != "" {
+		_, port, _ := net.SplitHostPort(normalizeDial(rec.AgentListen))
+		if port != "" {
+			a.cfg.ServerAddr = net.JoinHostPort(host, port)
+		}
+	}
+	if host != "" && rec.QUICListen != "" {
+		_, port, _ := net.SplitHostPort(normalizeDial(rec.QUICListen))
+		if port != "" {
+			a.cfg.QUICAddr = net.JoinHostPort(host, port)
+		}
+	}
+	if rec.WSURL != "" {
+		a.cfg.WSAddr = rec.WSURL
+	}
+	if rec.Region != "" {
+		a.cfg.Region = rec.Region
+	}
+	a.log.Info("region scheduled", "edge", rec.EdgeID, "region", rec.Region, "reason", rec.Reason,
+		"server", a.cfg.ServerAddr, "quic", a.cfg.QUICAddr, "ws", a.cfg.WSAddr)
+}
+
+func hostFromAdvertise(advertise string) string {
+	advertise = strings.TrimSpace(advertise)
+	advertise = strings.TrimPrefix(advertise, "https://")
+	advertise = strings.TrimPrefix(advertise, "http://")
+	advertise = strings.TrimRight(advertise, "/")
+	if advertise == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(advertise)
+	if err == nil {
+		return host
+	}
+	return advertise
+}
+
+func normalizeDial(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	if strings.HasPrefix(addr, ":") {
+		return "127.0.0.1" + addr
+	}
+	return addr
 }
 
 func (a *Agent) serveStreams(ctx context.Context, sess *tunnel.Session) error {

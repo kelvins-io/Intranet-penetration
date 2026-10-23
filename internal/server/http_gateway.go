@@ -12,6 +12,7 @@ import (
 
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
+	"github.com/kelvins-io/Intranet-penetration/internal/traffic"
 )
 
 func (s *Server) serveHTTPGateway(ctx context.Context, ln net.Listener) {
@@ -20,12 +21,19 @@ func (s *Server) serveHTTPGateway(ctx context.Context, ln net.Listener) {
 	if s.cfg.NormalizedRole() == config.RoleAll && s.cfg.APIListen == "" {
 		s.mountAPI(mux)
 		s.mountDashboard(mux)
+		s.mountAccessClient(mux)
 		s.mountInternalAPI(mux)
 	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		s.metrics.WritePrometheus(w)
+	})
+	mux.HandleFunc("/agent/ws", s.handleAgentWS)
+	mux.HandleFunc("/api/v1/regions/discover", s.handleRegionDiscover)
 	mux.HandleFunc("/internal/forward/", s.handleInternalForward)
 	mux.HandleFunc("/", s.handlePublicHTTP)
 
@@ -53,14 +61,14 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.enforceAccess(w, r, tenantID, name, "http.access") {
 		return
 	}
-	release, ok := s.enforceTraffic(w, tenantID, name, r.RemoteAddr)
+	release, bw, ok := s.enforceTraffic(w, tenantID, name, r.RemoteAddr)
 	if !ok {
 		return
 	}
 	defer release()
 
 	if route, exists := s.registry.Get(tenantID, name); exists && route.Type == protocol.TunnelHTTP {
-		s.proxyLocalHTTP(w, r, tenantID, name, rest)
+		s.proxyLocalHTTP(w, r, tenantID, name, rest, bw)
 		return
 	}
 
@@ -78,12 +86,13 @@ func (s *Server) handlePublicHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, fmt.Sprintf("tunnel %q offline", name), http.StatusBadGateway)
 }
 
-func (s *Server) proxyLocalHTTP(w http.ResponseWriter, r *http.Request, tenantID, name, rest string) {
+func (s *Server) proxyLocalHTTP(w http.ResponseWriter, r *http.Request, tenantID, name, rest string, bandwidthBPS int64) {
 	stream, err := s.registry.OpenToAgent(tenantID, name, r.RemoteAddr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	stream = traffic.WrapConn(stream, bandwidthBPS)
 	s.metrics.IncHTTP()
 	if route, ok := s.registry.Get(tenantID, name); ok && route.Session != nil && route.Session.E2E() {
 		s.metrics.IncE2E()
@@ -174,7 +183,7 @@ func (s *Server) handleInternalForward(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tunnel not on this edge", http.StatusBadGateway)
 		return
 	}
-	s.proxyLocalHTTP(w, r, tenantID, name, rest)
+	s.proxyLocalHTTP(w, r, tenantID, name, rest, 0)
 }
 
 func (s *Server) resolveHTTPTarget(r *http.Request) (tenantID, name, rest string, ok bool) {
@@ -209,7 +218,9 @@ func (s *Server) resolveHTTPTarget(r *http.Request) (tenantID, name, rest string
 	}
 
 	path := strings.TrimPrefix(r.URL.Path, "/")
-	if path == "" || strings.HasPrefix(path, "api/") || strings.HasPrefix(path, "dashboard") || strings.HasPrefix(path, "internal/") {
+	if path == "" || strings.HasPrefix(path, "api/") || strings.HasPrefix(path, "dashboard") ||
+		strings.HasPrefix(path, "internal/") || strings.HasPrefix(path, "access") ||
+		strings.HasPrefix(path, "metrics") || strings.HasPrefix(path, "agent/") {
 		return "", "", "", false
 	}
 	parts := strings.SplitN(path, "/", 3)
@@ -217,7 +228,7 @@ func (s *Server) resolveHTTPTarget(r *http.Request) (tenantID, name, rest string
 		return "", "", "", false
 	}
 	slug, tunName := parts[0], parts[1]
-	if slug == "healthz" || slug == "api" || slug == "dashboard" || slug == "internal" {
+	if pathReserved(slug) {
 		return "", "", "", false
 	}
 	tid, ok := s.resolveTenantSlug(slug)

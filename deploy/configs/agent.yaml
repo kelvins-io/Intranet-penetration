@@ -1,6 +1,9 @@
 server_addr: "127.0.0.1:7700"
 quic_addr: "127.0.0.1:7700"
 prefer_quic: true
+prefer_ws_fallback: true
+ws_addr: "ws://server:8088/agent/ws"
+discover_url: "http://server:8088/api/v1/regions/discover"
 prefer_e2e: true
 region: "cn-east"
 token: "dev-token-change-me"

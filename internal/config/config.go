@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -76,6 +77,7 @@ type ServerConfig struct {
 	Regions           []RegionPeer  `yaml:"regions"`
 	Cluster           ClusterConfig `yaml:"cluster"`
 	OIDC              OIDCConfig    `yaml:"oidc"`
+	ProbeInterval     time.Duration `yaml:"probe_interval"` // synthetic SLA probe; 0 = 15s
 	ReadTimeout       time.Duration `yaml:"read_timeout"`
 	WriteTimeout      time.Duration `yaml:"write_timeout"`
 }
@@ -135,8 +137,11 @@ type AgentPostureConfig struct {
 type AgentConfig struct {
 	ServerAddr      string             `yaml:"server_addr"`
 	QUICAddr        string             `yaml:"quic_addr"`
+	WSAddr          string             `yaml:"ws_addr"` // e.g. ws://127.0.0.1:8088/agent/ws
 	PreferQUIC      bool               `yaml:"prefer_quic"`
 	PreferE2E       bool               `yaml:"prefer_e2e"`
+	PreferWSFallback bool              `yaml:"prefer_ws_fallback"`
+	DiscoverURL     string             `yaml:"discover_url"` // region auto-schedule endpoint
 	Region          string             `yaml:"region"`
 	Token           string             `yaml:"token"`
 	AgentID         string             `yaml:"agent_id"`
@@ -168,6 +173,7 @@ func LoadServer(path string) (*ServerConfig, error) {
 		AgentMTLS:         "off",
 		AccessDefaultDeny: false,
 		ResumeTTL:         5 * time.Minute,
+		ProbeInterval:     15 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
@@ -241,12 +247,13 @@ func normalizeListen(addr string) string {
 
 func LoadAgent(path string) (*AgentConfig, error) {
 	cfg := &AgentConfig{
-		ServerAddr:      "127.0.0.1:7700",
-		PreferQUIC:      true,
-		PreferE2E:       true,
-		Region:          "local",
-		Reconnect:       3 * time.Second,
-		ResumeTokenFile: "data/agent_resume.token",
+		ServerAddr:       "127.0.0.1:7700",
+		PreferQUIC:       true,
+		PreferE2E:        true,
+		PreferWSFallback: true,
+		Region:           "local",
+		Reconnect:        3 * time.Second,
+		ResumeTokenFile:  "data/agent_resume.token",
 	}
 	if err := loadYAML(path, cfg); err != nil {
 		return nil, err
@@ -263,6 +270,13 @@ func LoadAgent(path string) (*AgentConfig, error) {
 	}
 	if cfg.QUICAddr == "" {
 		cfg.QUICAddr = cfg.ServerAddr
+	}
+	if cfg.WSAddr == "" && cfg.PreferWSFallback {
+		host := "127.0.0.1"
+		if h, _, err := net.SplitHostPort(cfg.ServerAddr); err == nil && h != "" {
+			host = h
+		}
+		cfg.WSAddr = "ws://" + host + ":8088/agent/ws"
 	}
 	if len(cfg.Tunnels) == 0 {
 		return nil, fmt.Errorf("at least one tunnel is required")

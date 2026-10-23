@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/kelvins-io/Intranet-penetration/internal/traffic"
 	"github.com/kelvins-io/Intranet-penetration/internal/tunnel"
 )
 
@@ -57,7 +58,7 @@ func (s *Server) handleTCPConn(tenantID, tunnelName string, client net.Conn) {
 		s.log.Warn("tcp access denied", "tunnel", tunnelName, "remote", remote)
 		return
 	}
-	release, err := s.enforceTCPTraffic(tenantID, tunnelName, remote)
+	release, bw, err := s.enforceTCPTraffic(tenantID, tunnelName, remote)
 	if err != nil {
 		s.log.Warn("tcp traffic limited", "tunnel", tunnelName, "remote", remote)
 		return
@@ -74,5 +75,5 @@ func (s *Server) handleTCPConn(tenantID, tunnelName string, client net.Conn) {
 		s.metrics.IncE2E()
 	}
 	s.auditEvent(tenantID, "public", "tcp.access", tunnelName, remote)
-	tunnel.Proxy(client, stream)
+	tunnel.Proxy(traffic.WrapConn(client, bw), stream)
 }

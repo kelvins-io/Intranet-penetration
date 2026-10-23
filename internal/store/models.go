@@ -138,19 +138,20 @@ type AgentCert struct {
 
 // TrafficPolicy limits public traffic to tunnels after AccessPolicy allows.
 // Scope: ip | tunnel | ip+tunnel (default ip+tunnel).
-// RateRPS=0 and MaxConcurrent=0 means no limit for that dimension.
+// RateRPS=0, MaxConcurrent=0, MaxBandwidthBPS=0 means no limit for that dimension.
 type TrafficPolicy struct {
-	ID            string    `json:"id"`
-	TenantID      string    `json:"tenant_id"`
-	Name          string    `json:"name"`
-	Enabled       bool      `json:"enabled"`
-	Priority      int       `json:"priority"`
-	Tunnels       []string  `json:"tunnels"` // exact or "*"
-	Scope         string    `json:"scope"`   // ip | tunnel | ip+tunnel
-	RateRPS       float64   `json:"rate_rps"`
-	Burst         int       `json:"burst"`
-	MaxConcurrent int       `json:"max_concurrent"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID               string    `json:"id"`
+	TenantID         string    `json:"tenant_id"`
+	Name             string    `json:"name"`
+	Enabled          bool      `json:"enabled"`
+	Priority         int       `json:"priority"`
+	Tunnels          []string  `json:"tunnels"` // exact or "*"
+	Scope            string    `json:"scope"`   // ip | tunnel | ip+tunnel
+	RateRPS          float64   `json:"rate_rps"`
+	Burst            int       `json:"burst"`
+	MaxConcurrent    int       `json:"max_concurrent"`
+	MaxBandwidthBPS  int64     `json:"max_bandwidth_bps"` // bytes/sec per scope key; 0 = unlimited
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type Snapshot struct {

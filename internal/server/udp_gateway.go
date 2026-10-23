@@ -107,7 +107,7 @@ func (s *Server) handleUDPAssoc(ctx context.Context, pc *net.UDPConn, tenantID, 
 		s.log.Warn("udp access denied", "tunnel", tunnelName, "remote", remote)
 		return
 	}
-	release, err := s.enforceTCPTraffic(tenantID, tunnelName, remote)
+	release, _, err := s.enforceTCPTraffic(tenantID, tunnelName, remote)
 	if err != nil {
 		s.log.Warn("udp traffic limited", "tunnel", tunnelName, "remote", remote)
 		return
@@ -126,7 +126,7 @@ func (s *Server) handleUDPAssoc(ctx context.Context, pc *net.UDPConn, tenantID, 
 	}
 	defer stream.Close()
 
-	s.metrics.IncTCP()
+	s.metrics.IncUDP()
 	s.auditEvent(tenantID, "public", "udp.access", tunnelName, remote)
 
 	idle := 60 * time.Second

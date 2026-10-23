@@ -13,10 +13,11 @@ import (
 
 // Decision is the result of a rate-limit check.
 type Decision struct {
-	Allowed bool
-	Reason  string
-	Policy  string
-	Release func() // call when connection/request finishes (concurrent)
+	Allowed      bool
+	Reason       string
+	Policy       string
+	BandwidthBPS int64  // from matched policy; 0 = unlimited
+	Release      func() // call when connection/request finishes (concurrent)
 }
 
 type tokenBucket struct {
@@ -46,6 +47,7 @@ func (l *Limiter) Allow(policies []store.TrafficPolicy, tenantID, tunnel, remote
 	if p == nil {
 		return Decision{Allowed: true, Reason: "no traffic policy", Release: func() {}}
 	}
+	bw := p.MaxBandwidthBPS
 	key := scopeKey(p.Scope, tenantID, tunnel, remoteIP(remoteAddr))
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -74,10 +76,11 @@ func (l *Limiter) Allow(policies []store.TrafficPolicy, tenantID, tunnel, remote
 		}
 		if b.tokens < 1 {
 			return Decision{
-				Allowed: false,
-				Reason:  fmt.Sprintf("rate limit %.2f rps", p.RateRPS),
-				Policy:  p.Name,
-				Release: func() {},
+				Allowed:      false,
+				Reason:       fmt.Sprintf("rate limit %.2f rps", p.RateRPS),
+				Policy:       p.Name,
+				BandwidthBPS: bw,
+				Release:      func() {},
 			}
 		}
 		b.tokens--
@@ -86,18 +89,20 @@ func (l *Limiter) Allow(policies []store.TrafficPolicy, tenantID, tunnel, remote
 	if p.MaxConcurrent > 0 {
 		if l.concurrent[key] >= p.MaxConcurrent {
 			return Decision{
-				Allowed: false,
-				Reason:  fmt.Sprintf("max concurrent %d", p.MaxConcurrent),
-				Policy:  p.Name,
-				Release: func() {},
+				Allowed:      false,
+				Reason:       fmt.Sprintf("max concurrent %d", p.MaxConcurrent),
+				Policy:       p.Name,
+				BandwidthBPS: bw,
+				Release:      func() {},
 			}
 		}
 		l.concurrent[key]++
 		k := key
 		return Decision{
-			Allowed: true,
-			Reason:  "ok",
-			Policy:  p.Name,
+			Allowed:      true,
+			Reason:       "ok",
+			Policy:       p.Name,
+			BandwidthBPS: bw,
 			Release: func() {
 				l.mu.Lock()
 				defer l.mu.Unlock()
@@ -107,7 +112,7 @@ func (l *Limiter) Allow(policies []store.TrafficPolicy, tenantID, tunnel, remote
 			},
 		}
 	}
-	return Decision{Allowed: true, Reason: "ok", Policy: p.Name, Release: func() {}}
+	return Decision{Allowed: true, Reason: "ok", Policy: p.Name, BandwidthBPS: bw, Release: func() {}}
 }
 
 func selectPolicy(policies []store.TrafficPolicy, tenantID, tunnel string) *store.TrafficPolicy {
@@ -116,7 +121,7 @@ func selectPolicy(policies []store.TrafficPolicy, tenantID, tunnel string) *stor
 		if !p.Enabled || p.TenantID != tenantID {
 			continue
 		}
-		if p.RateRPS <= 0 && p.MaxConcurrent <= 0 {
+		if p.RateRPS <= 0 && p.MaxConcurrent <= 0 && p.MaxBandwidthBPS <= 0 {
 			continue
 		}
 		if !matchTunnel(p.Tunnels, tunnel) {

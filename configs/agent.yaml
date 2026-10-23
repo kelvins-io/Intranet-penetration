@@ -1,7 +1,11 @@
 server_addr: "127.0.0.1:7700"
 quic_addr: "127.0.0.1:7700"
+ws_addr: "ws://127.0.0.1:8088/agent/ws"
 prefer_quic: true
 prefer_e2e: true
+prefer_ws_fallback: true
+# 区域自动调度（可选）：启动前拉取推荐 Edge
+discover_url: "http://127.0.0.1:8088/api/v1/regions/discover"
 region: "local"
 token: "dev-token-change-me"
 agent_id: "dev-agent"

@@ -16,6 +16,7 @@ agent_mtls: "off"
 # 无匹配策略时是否默认拒绝公网访问
 access_default_deny: false
 resume_ttl: 5m
+probe_interval: 15s
 admin_email: "admin@localhost"
 admin_password: "admin123"
 tls_cert: "server.crt"
