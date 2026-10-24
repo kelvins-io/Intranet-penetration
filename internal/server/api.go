@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kelvins-io/Intranet-penetration/internal/policy"
 	"github.com/kelvins-io/Intranet-penetration/internal/store"
 )
 
@@ -41,6 +42,9 @@ func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/postures", s.withAuth(s.handleAgentPostures))
 	mux.HandleFunc("/api/v1/certs", s.withAuth(s.handleCerts))
 	mux.HandleFunc("/api/v1/certs/ca", s.withAuth(s.handleCACert))
+	mux.HandleFunc("/api/v1/client/bootstrap", s.withAuth(s.handleClientBootstrap))
+	mux.HandleFunc("/api/v1/client/resources", s.withAuth(s.handleClientResources))
+	mux.HandleFunc("/api/v1/client/sessions", s.withAuth(s.handleClientSessions))
 	// backward compatible
 	mux.HandleFunc("/api/tunnels", s.handleLegacyTunnels)
 }
@@ -773,6 +777,55 @@ func (s *Server) handleLegacyTunnels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleClientBootstrap(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	prefer := r.URL.Query().Get("prefer")
+	if prefer == "" {
+		prefer = s.cfg.Region
+	}
+	rec := s.recommendRegion(prefer)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tenant_id":   au.Tenant.ID,
+		"tenant_slug": au.Tenant.Slug,
+		"user_email":  au.User.Email,
+		"edge":        rec,
+		"agent_listen": s.cfg.Listen,
+		"quic_listen":  s.cfg.QUICListen,
+		"ws_url":       rec.WSURL,
+		"socks_hint":   "127.0.0.1:1080",
+		"protocol":     5,
+	})
+}
+
+func (s *Server) handleClientResources(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := policy.Identity{Email: au.User.Email, Role: au.User.Role, UserID: au.User.ID}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resources": s.projectClientResources(au.Tenant, id),
+	})
+}
+
+func (s *Server) handleClientSessions(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// Short-lived session uses the same API key surface for P0; returns hint metadata.
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"token":            au.User.APIKey,
+		"expires_in_sec":   3600,
+		"user_email":       au.User.Email,
+		"tenant_id":        au.Tenant.ID,
+		"note":             "P0: session token equals user API key; rotate via user settings later",
+	})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

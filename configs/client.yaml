@@ -1,0 +1,14 @@
+control_api: "http://127.0.0.1:8088"
+server_addr: "127.0.0.1:7700"
+quic_addr: "127.0.0.1:7700"
+ws_addr: "ws://127.0.0.1:8088/agent/ws"
+prefer_quic: true
+prefer_ws_fallback: true
+# 用户 API Key（或环境变量 IP_CLIENT_TOKEN）
+token: "change-me"
+region: "local"
+device_id: ""
+socks_listen: "127.0.0.1:1080"
+mode: "socks" # socks | tun | both（tun 为 P1 占位）
+system_proxy: false # true 时尝试设置系统 SOCKS 代理（darwin/linux）
+reconnect: 3s

@@ -30,3 +30,4 @@ jobs:
           go build -o bin/control ./cmd/control
           go build -o bin/edge ./cmd/edge
           go build -o bin/agent ./cmd/agent
+          go build -o bin/client ./cmd/client

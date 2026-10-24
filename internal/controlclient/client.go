@@ -69,9 +69,11 @@ type ResolveResponse struct {
 }
 
 type IdentityResponse struct {
-	Email  string     `json:"email"`
-	Role   store.Role `json:"role"`
-	UserID string     `json:"user_id"`
+	Email      string     `json:"email"`
+	Role       store.Role `json:"role"`
+	UserID     string     `json:"user_id"`
+	TenantID   string     `json:"tenant_id,omitempty"`
+	TenantSlug string     `json:"tenant_slug,omitempty"`
 }
 
 func (c *Client) AgentHello(req HelloRequest) (*HelloResponse, error) {

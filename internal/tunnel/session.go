@@ -128,12 +128,13 @@ func (s *Session) CloseChan() <-chan struct{} {
 	return s.mux.CloseChan()
 }
 
-// HandshakeAsServer reads Hello and writes HelloAck.
-func (s *Session) HandshakeAsServer(validate func(protocol.Hello) (*protocol.HelloAck, error)) (*protocol.Hello, *protocol.HelloAck, error) {
-	env, err := protocol.ReadJSON(s.control)
-	if err != nil {
-		return nil, nil, err
-	}
+// ReadControlEnvelope reads one control-plane JSON envelope.
+func (s *Session) ReadControlEnvelope() (protocol.Envelope, error) {
+	return protocol.ReadJSON(s.control)
+}
+
+// HandshakeAsServerFromEnv continues an agent handshake after the hello envelope was peeked.
+func (s *Session) HandshakeAsServerFromEnv(env protocol.Envelope, validate func(protocol.Hello) (*protocol.HelloAck, error)) (*protocol.Hello, *protocol.HelloAck, error) {
 	if env.Type != protocol.MsgHello {
 		return nil, nil, fmt.Errorf("expected hello, got %s", env.Type)
 	}
@@ -156,6 +157,66 @@ func (s *Session) HandshakeAsServer(validate func(protocol.Hello) (*protocol.Hel
 		return &hello, nil, err
 	}
 	return &hello, ack, nil
+}
+
+// HandshakeAsServer reads Hello and writes HelloAck.
+func (s *Session) HandshakeAsServer(validate func(protocol.Hello) (*protocol.HelloAck, error)) (*protocol.Hello, *protocol.HelloAck, error) {
+	env, err := s.ReadControlEnvelope()
+	if err != nil {
+		return nil, nil, err
+	}
+	return s.HandshakeAsServerFromEnv(env, validate)
+}
+
+// HandshakeClientAsServer completes a client_hello handshake.
+func (s *Session) HandshakeClientAsServer(env protocol.Envelope, validate func(protocol.ClientHello) (*protocol.ClientHelloAck, error)) (*protocol.ClientHello, *protocol.ClientHelloAck, error) {
+	if env.Type != protocol.MsgClientHello {
+		return nil, nil, fmt.Errorf("expected client_hello, got %s", env.Type)
+	}
+	var hello protocol.ClientHello
+	if err := protocol.DecodeBody(env, &hello); err != nil {
+		return nil, nil, err
+	}
+	ack, err := validate(hello)
+	if err != nil {
+		_ = protocol.WriteJSON(s.control, protocol.MsgError, protocol.ErrorBody{
+			Code:    "auth_failed",
+			Message: err.Error(),
+		})
+		return &hello, nil, err
+	}
+	if err := protocol.WriteJSON(s.control, protocol.MsgClientHelloAck, ack); err != nil {
+		return &hello, nil, err
+	}
+	return &hello, ack, nil
+}
+
+// HandshakeAsUserClient sends ClientHello and waits for ClientHelloAck.
+func (s *Session) HandshakeAsUserClient(hello protocol.ClientHello) (*protocol.ClientHelloAck, error) {
+	if err := protocol.WriteJSON(s.control, protocol.MsgClientHello, hello); err != nil {
+		return nil, err
+	}
+	env, err := protocol.ReadJSON(s.control)
+	if err != nil {
+		return nil, err
+	}
+	switch env.Type {
+	case protocol.MsgClientHelloAck:
+		var ack protocol.ClientHelloAck
+		if err := protocol.DecodeBody(env, &ack); err != nil {
+			return nil, err
+		}
+		return &ack, nil
+	case protocol.MsgError:
+		var eb protocol.ErrorBody
+		_ = protocol.DecodeBody(env, &eb)
+		if eb.Message == "" {
+			eb.Message = "handshake rejected"
+		}
+		return nil, fmt.Errorf("%s: %s", eb.Code, eb.Message)
+	default:
+		return nil, fmt.Errorf("unexpected message %s", env.Type)
+	}
 }
 
 // HandshakeAsClient sends Hello and waits for HelloAck.

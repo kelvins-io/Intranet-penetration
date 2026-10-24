@@ -14,7 +14,6 @@ func (s *Server) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("agent ws upgrade failed", "err", err, "remote", r.RemoteAddr)
 		return
 	}
-	s.log.Info("agent connected", "transport", "websocket", "remote", r.RemoteAddr)
-	// Hijacked connection; serve until session ends.
-	s.serveAgentSession(context.Background(), sess, r.RemoteAddr, "")
+	s.log.Info("mux connected", "transport", "websocket", "remote", r.RemoteAddr)
+	s.serveMuxSession(context.Background(), sess, r.RemoteAddr, "")
 }

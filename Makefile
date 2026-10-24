@@ -1,10 +1,11 @@
-.PHONY: build run-server run-control run-edge run-agent run-demo test tidy vet ci private-up private-down
+.PHONY: build run-server run-control run-edge run-agent run-client run-demo test tidy vet ci private-up private-down
 
 build:
 	go build -o bin/server ./cmd/server
 	go build -o bin/control ./cmd/control
 	go build -o bin/edge ./cmd/edge
 	go build -o bin/agent ./cmd/agent
+	go build -o bin/client ./cmd/client
 	go build -o bin/local-http ./examples/local-http
 
 tidy:
@@ -29,6 +30,9 @@ run-edge:
 
 run-agent:
 	go run ./cmd/agent -config configs/agent.yaml
+
+run-client:
+	go run ./cmd/client -config configs/client.yaml
 
 run-demo:
 	go run ./examples/local-http

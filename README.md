@@ -1,15 +1,14 @@
 # Intranet Penetration
 
-工业级内网穿透平台。当前进度：**跨 Edge TCP/UDP · 穿透探针/Trace · 控制面 HA + Resume 共享**。
+工业级内网穿透平台。当前进度：**用户 Access Client（SOCKS5 / 系统代理）· 协议 v5 · TUN 预留**。
 
 ## 架构
 
 ```
-公网用户 ──► 任意 Edge（HTTP / 影子 TCP·UDP 端口）
-              │ 本机 Agent → 直接开流
-              │ 他机隧道 → /internal/stream WebSocket 中继到 Owning Edge
-Agent ── QUIC → TCP → WebSocket ──► Edge
-Resume / 控制面 Snapshot ──► Redis（可选 HA）
+用户 App ──► 本机 SOCKS5 / 系统代理 ──► cmd/client
+                                         │ client_hello + dial
+                                         ▼
+                                      Edge ── AccessPolicy ──► Agent ──► 内网服务
 ```
 
 ## 快速开始
@@ -17,47 +16,38 @@ Resume / 控制面 Snapshot ──► Redis（可选 HA）
 ```bash
 make ci
 make run-demo && make run-server && make run-agent
-curl http://127.0.0.1:8088/default/demo/
-curl http://127.0.0.1:8088/metrics
-open http://127.0.0.1:8088/access/
+
+# 填入用户 API Key（admin 登录 / Bootstrap key）
+# configs/client.yaml → token: "..."
+make run-client
+
+# 应用走 SOCKS5
+curl --socks5-hostname 127.0.0.1:1080 http://demo.default.tunnel.local/
+# 或开启 system_proxy: true（macOS networksetup / Linux gsettings）
 ```
 
-## 跨 Edge TCP/UDP
+HTTP 资源也可继续浏览器直连：`http://127.0.0.1:8088/default/demo/`（`browser_url`）。
 
-- Owning Edge 在 `RemotePort` 上监听并登记到 Redis Registry。
-- 其他 Edge 每 5s 同步「影子监听」，同端口接收流量后经 `ws://peer/internal/stream/{tcp|udp}/...` 转发。
-- 本地 `OpenToAgent` 失败时也会按 cluster 位置主动 peer 中继。
+## 用户 Client（P0）
 
-## 穿透探针与 Trace
+| 项 | 说明 |
+|----|------|
+| 二进制 | `cmd/client` / `make run-client` |
+| 协议 | v5 `client_hello` / `dial`（与 Agent 共用 Edge mux / WS） |
+| 本地 | SOCKS5（默认 `127.0.0.1:1080`） |
+| 系统代理 | `system_proxy: true`（darwin/linux） |
+| TUN | `mode: tun\|both` 仅占位日志，P1 实现 VIP/DNS |
+| API | `/api/v1/client/bootstrap` · `/resources` · `/sessions` |
 
-```yaml
-probe_interval: 15s
-probe_path: "/default/demo/"   # 可选；优先于 healthz 计入 SLA
-```
+## 跨 Edge / 观测 / HA
 
-- `/healthz` + `probe_path` 双探针；SLA `availability_source` 可为 `path_probe_window`
-- HTTP 网关注入 `X-Request-ID`，结构化 `trace` 日志
+见先前提交：影子 TCP/UDP、穿透探针、`cluster.redis_url` 下 Resume 与控制面快照 HA。
 
-## 控制面 HA + Resume 共享
-
-配置 `cluster.redis_url` 后：
-
-| 组件 | 行为 |
-|------|------|
-| Tunnel Registry | Redis（已有） |
-| Resume Token | Redis 共享，Agent 可换 Edge 续接 |
-| Control `store.json` | 双写 Redis `ip:store:snapshot`，启动 Hydrate |
-
-无 Redis 时退回进程内存 / 本地文件。
-
-## Access / 流量 / WS
-
-见先前里程碑：Access Policy、Traffic（含带宽）、WebSocket 保底、`/access/` 门户、区域 discover。
-
-## 角色拆分
+## 角色
 
 | 角色 | 命令 |
 |------|------|
 | all | `make run-server` |
-| Control | `make run-control` |
-| Edge | `make run-edge` |
+| Control / Edge | `make run-control` / `make run-edge` |
+| Agent | `make run-agent` |
+| User Client | `make run-client` |

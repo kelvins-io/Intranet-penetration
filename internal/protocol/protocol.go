@@ -9,20 +9,29 @@ import (
 )
 
 const (
-	Version = 4
+	Version = 5
 
 	MaxFrameSize = 1 << 20 // 1 MiB
 )
 
 // Control message types exchanged on the yamux control stream (stream id 0 opens first).
 const (
-	MsgHello    = "hello"
-	MsgHelloAck = "hello_ack"
-	MsgOpen     = "open"
-	MsgOpenAck  = "open_ack"
-	MsgPing     = "ping"
-	MsgPong     = "pong"
-	MsgError    = "error"
+	MsgHello          = "hello"
+	MsgHelloAck       = "hello_ack"
+	MsgClientHello    = "client_hello"
+	MsgClientHelloAck = "client_hello_ack"
+	MsgDial           = "dial"
+	MsgDialAck        = "dial_ack"
+	MsgOpen           = "open"
+	MsgOpenAck        = "open_ack"
+	MsgPing           = "ping"
+	MsgPong           = "pong"
+	MsgError          = "error"
+)
+
+const (
+	RoleAgent  = "agent"
+	RoleClient = "client"
 )
 
 type TunnelType string
@@ -59,6 +68,7 @@ type TunnelSpec struct {
 
 type Hello struct {
 	Version     int           `json:"version"`
+	Role        string        `json:"role,omitempty"` // agent (default) | client — agents omit
 	Token       string        `json:"token"`
 	AgentID     string        `json:"agent_id"`
 	ResumeToken string        `json:"resume_token,omitempty"`
@@ -66,6 +76,56 @@ type Hello struct {
 	Region      string        `json:"region,omitempty"`
 	Posture     DevicePosture `json:"posture,omitempty"`
 	Tunnels     []TunnelSpec  `json:"tunnels"`
+}
+
+// ClientHello is sent by the user Access Client on the control stream.
+type ClientHello struct {
+	Version   int           `json:"version"`
+	Token     string        `json:"token"` // user API key or client session token
+	DeviceID  string        `json:"device_id,omitempty"`
+	Region    string        `json:"region,omitempty"`
+	Posture   DevicePosture `json:"posture,omitempty"`
+	ClientVer string        `json:"client_version,omitempty"`
+}
+
+// ClientResource is a policy-projected tunnel the user may dial.
+type ClientResource struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Type       TunnelType `json:"type"`
+	Hostname   string     `json:"hostname,omitempty"`    // e.g. demo.default.tunnel.local
+	VIP        string     `json:"vip,omitempty"`         // reserved for TUN (P1)
+	Port       int        `json:"port,omitempty"`        // tcp/udp public port hint
+	BrowserURL string     `json:"browser_url,omitempty"` // preferred for http
+	TenantSlug string     `json:"tenant_slug,omitempty"`
+	TenantID   string     `json:"tenant_id,omitempty"`
+}
+
+type ClientHelloAck struct {
+	Version     int              `json:"version"`
+	UserEmail   string           `json:"user_email,omitempty"`
+	TenantID    string           `json:"tenant_id,omitempty"`
+	TenantSlug  string           `json:"tenant_slug,omitempty"`
+	EdgeID      string           `json:"edge_id,omitempty"`
+	Region      string           `json:"region,omitempty"`
+	SessionTTL  int              `json:"session_ttl_sec,omitempty"`
+	Resources   []ClientResource `json:"resources"`
+	SOCKSHint   string           `json:"socks_hint,omitempty"` // e.g. 127.0.0.1:1080
+	Message     string           `json:"message,omitempty"`
+}
+
+// DialRequest is the first frame on a client-opened yamux stream.
+type DialRequest struct {
+	ResourceID string     `json:"resource_id,omitempty"`
+	Host       string     `json:"host,omitempty"` // hostname or host:port
+	Port       int        `json:"port,omitempty"`
+	Mode       TunnelType `json:"mode,omitempty"` // tcp | udp; default tcp
+}
+
+type DialAck struct {
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+	ResourceID string `json:"resource_id,omitempty"`
 }
 
 type AssignedTunnel struct {

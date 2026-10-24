@@ -449,14 +449,14 @@ func (s *Server) handleAgentTCP(ctx context.Context, conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	s.log.Info("agent connected", "remote", remote, "transport", "tcp", "peer_cn", peerCN)
+	s.log.Info("mux connected", "remote", remote, "transport", "tcp", "peer_cn", peerCN)
 	defer conn.Close()
 	sess, err := tunnel.ServerSession(conn)
 	if err != nil {
 		s.log.Debug("yamux server", "err", err, "remote", remote)
 		return
 	}
-	s.serveAgentSession(ctx, sess, remote, peerCN)
+	s.serveMuxSession(ctx, sess, remote, peerCN)
 }
 
 func (s *Server) handleAgentQUIC(ctx context.Context, conn *quic.Conn) {
@@ -475,21 +475,31 @@ func (s *Server) handleAgentQUIC(ctx context.Context, conn *quic.Conn) {
 		_ = conn.CloseWithError(1, "mtls required")
 		return
 	}
-	s.log.Info("agent connected", "remote", remote, "transport", "quic", "peer_cn", peerCN)
+	s.log.Info("mux connected", "remote", remote, "transport", "quic", "peer_cn", peerCN)
 	defer conn.CloseWithError(0, "done")
 	sess, err := tunnel.ServerQUICSession(conn)
 	if err != nil {
 		s.log.Debug("quic session", "err", err, "remote", remote)
 		return
 	}
-	s.serveAgentSession(ctx, sess, remote, peerCN)
+	s.serveMuxSession(ctx, sess, remote, peerCN)
 }
 
 func (s *Server) serveAgentSession(ctx context.Context, sess *tunnel.Session, remote, peerCN string) {
+	env, err := sess.ReadControlEnvelope()
+	if err != nil {
+		s.log.Debug("agent hello peek", "err", err, "remote", remote)
+		_ = sess.Close()
+		return
+	}
+	s.serveAgentSessionFromHello(ctx, sess, env, remote, peerCN)
+}
+
+func (s *Server) serveAgentSessionFromHello(ctx context.Context, sess *tunnel.Session, env protocol.Envelope, remote, peerCN string) {
 	defer sess.Close()
 
 	var tenant *store.Tenant
-	hello, ack, err := sess.HandshakeAsServer(func(h protocol.Hello) (*protocol.HelloAck, error) {
+	hello, ack, err := sess.HandshakeAsServerFromEnv(env, func(h protocol.Hello) (*protocol.HelloAck, error) {
 		if s.cfg.AgentMTLS == "require" {
 			if peerCN == "" {
 				return nil, fmt.Errorf("client certificate required")
@@ -724,7 +734,7 @@ func (s *Server) validateHelloRemote(hello protocol.Hello) (*protocol.HelloAck, 
 }
 
 func (s *Server) validateHelloLocal(hello protocol.Hello) (*protocol.HelloAck, *store.Tenant, error) {
-	if hello.Version != 0 && hello.Version != protocol.Version && hello.Version != 1 && hello.Version != 3 {
+	if hello.Version != 0 && !supportedProtocolVersion(hello.Version) {
 		return nil, nil, fmt.Errorf("unsupported protocol version %d", hello.Version)
 	}
 	if hello.AgentID == "" {
@@ -1036,6 +1046,15 @@ func (s *Server) listTrafficPolicies(tenantID string) []store.TrafficPolicy {
 	s.traffic.at = time.Now()
 	s.traffic.mu.Unlock()
 	return p
+}
+
+func supportedProtocolVersion(v int) bool {
+	switch v {
+	case 1, 3, 4, protocol.Version:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) invalidatePolicyCache() {

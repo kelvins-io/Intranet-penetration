@@ -63,7 +63,7 @@ func (s *Server) handleInternalHello(w http.ResponseWriter, r *http.Request) {
 
 // validateHelloForControl assigns domains/quota without allocating TCP ports (Edge does that).
 func (s *Server) validateHelloForControl(hello protocol.Hello, publicHost, baseDomain string) (*protocol.HelloAck, *store.Tenant, error) {
-	if hello.Version != 0 && hello.Version != protocol.Version && hello.Version != 1 && hello.Version != 3 {
+	if hello.Version != 0 && !supportedProtocolVersion(hello.Version) {
 		return nil, nil, fmt.Errorf("unsupported protocol version %d", hello.Version)
 	}
 	if hello.AgentID == "" {
@@ -265,13 +265,14 @@ func (s *Server) handleInternalIdentity(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, "api_key required")
 		return
 	}
-	u, _, err := s.store.ResolveUserAPIKey(key)
+	u, ten, err := s.store.ResolveUserAPIKey(key)
 	if err != nil {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	writeJSON(w, http.StatusOK, controlclient.IdentityResponse{
 		Email: u.Email, Role: u.Role, UserID: u.ID,
+		TenantID: ten.ID, TenantSlug: ten.Slug,
 	})
 }
 
