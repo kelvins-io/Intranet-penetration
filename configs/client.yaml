@@ -9,6 +9,24 @@ token: "change-me"
 region: "local"
 device_id: ""
 socks_listen: "127.0.0.1:1080"
-mode: "socks" # socks | tun | both（tun 为 P1 占位）
+mode: "socks" # socks | tun | both
 system_proxy: false # true 时尝试设置系统 SOCKS 代理（darwin/linux）
+# TUN（mode: tun|both，需 root/管理员；VIP 100.64.0.0/10）
+tun_name: ""           # 空则 darwin=utun / linux=ip0 / windows=IPClient
+dns_listen: "127.0.0.1:1053"
+write_hosts: false     # true 时写入 /etc/hosts（需权限）
+# P2：本机控制面板（设为 "-" 关闭）
+panel_listen: "127.0.0.1:17890"
+exit_on_kick: false
+# 可选 Client mTLS（当服务端 agent_mtls=require/optional）
+mtls:
+  enabled: false
+  cert_file: ""
+  key_file: ""
+  ca_file: ""
+  insecure_skip_verify: true
+posture:
+  # device_id: ""
+  # encrypted: true
+  # firewall: true
 reconnect: 3s

@@ -967,3 +967,121 @@ func (s *Store) ListAgentPostures(tenantID string) []AgentPosture {
 	}
 	return out
 }
+
+// BindOrTouchDevice enrolls or refreshes a user client device binding.
+// mode: off (no-op) | auto (create if missing) | require (must already exist).
+func (s *Store) BindOrTouchDevice(mode, tenantID, userID, email, deviceID, hostname, osName, arch string) (*BoundDevice, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" || mode == "off" {
+		return nil, nil
+	}
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return nil, fmt.Errorf("device_id required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	for i := range s.data.BoundDevices {
+		d := &s.data.BoundDevices[i]
+		if d.TenantID != tenantID || d.DeviceID != deviceID || d.Revoked {
+			continue
+		}
+		if d.UserID != userID {
+			return nil, fmt.Errorf("device bound to another user")
+		}
+		d.LastSeen = now
+		d.Hostname = hostname
+		d.OS = osName
+		d.Arch = arch
+		d.Email = email
+		cp := *d
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
+		return &cp, nil
+	}
+	if mode == "require" {
+		return nil, fmt.Errorf("device not enrolled (require_device_bind)")
+	}
+	// auto
+	d := BoundDevice{
+		ID:       NewID("dev"),
+		TenantID: tenantID,
+		UserID:   userID,
+		Email:    email,
+		DeviceID: deviceID,
+		Hostname: hostname,
+		OS:       osName,
+		Arch:     arch,
+		BoundAt:  now,
+		LastSeen: now,
+	}
+	s.data.BoundDevices = append(s.data.BoundDevices, d)
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+func (s *Store) ListBoundDevices(tenantID string) []BoundDevice {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []BoundDevice{}
+	for _, d := range s.data.BoundDevices {
+		if tenantID == "" || d.TenantID == tenantID {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func (s *Store) RevokeBoundDevice(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.BoundDevices {
+		if s.data.BoundDevices[i].ID == id {
+			s.data.BoundDevices[i].Revoked = true
+			return s.persistLocked()
+		}
+	}
+	return ErrNotFound
+}
+
+func (s *Store) EnrollBoundDevice(d BoundDevice) (*BoundDevice, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if d.TenantID == "" || d.UserID == "" || d.DeviceID == "" {
+		return nil, fmt.Errorf("tenant_id, user_id, device_id required")
+	}
+	now := time.Now().UTC()
+	for i := range s.data.BoundDevices {
+		ex := &s.data.BoundDevices[i]
+		if ex.TenantID == d.TenantID && ex.DeviceID == d.DeviceID && !ex.Revoked {
+			if ex.UserID != d.UserID {
+				return nil, ErrConflict
+			}
+			ex.LastSeen = now
+			ex.Hostname = d.Hostname
+			ex.OS = d.OS
+			ex.Arch = d.Arch
+			ex.Email = d.Email
+			cp := *ex
+			if err := s.persistLocked(); err != nil {
+				return nil, err
+			}
+			return &cp, nil
+		}
+	}
+	if d.ID == "" {
+		d.ID = NewID("dev")
+	}
+	d.BoundAt = now
+	d.LastSeen = now
+	d.Revoked = false
+	s.data.BoundDevices = append(s.data.BoundDevices, d)
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}

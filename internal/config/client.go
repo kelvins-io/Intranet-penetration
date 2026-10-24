@@ -21,10 +21,21 @@ type ClientConfig struct {
 	DeviceID string `yaml:"device_id"`
 
 	SOCKSListen string `yaml:"socks_listen"` // default 127.0.0.1:1080
-	Mode        string `yaml:"mode"`         // socks | tun | both — P0: socks
+	Mode        string `yaml:"mode"`         // socks | tun | both
 
 	SystemProxy bool          `yaml:"system_proxy"` // set OS proxy to SOCKS
 	Reconnect   time.Duration `yaml:"reconnect"`
+
+	// TUN / split-tunnel (P1)
+	TunName    string `yaml:"tun_name"`    // darwin: utun; linux: ip0; windows: IPClient
+	DNSListen  string `yaml:"dns_listen"`  // default 127.0.0.1:1053
+	WriteHosts bool   `yaml:"write_hosts"` // rewrite /etc/hosts for VIP mapping
+
+	// P2: local control panel + optional client mTLS + posture
+	PanelListen string             `yaml:"panel_listen"` // default 127.0.0.1:17890; empty disables
+	ExitOnKick  bool               `yaml:"exit_on_kick"` // exit process when Edge kicks session
+	MTLS        AgentMTLSConfig    `yaml:"mtls"`
+	Posture     AgentPostureConfig `yaml:"posture"`
 }
 
 func LoadClient(path string) (*ClientConfig, error) {
@@ -47,6 +58,9 @@ func LoadClient(path string) (*ClientConfig, error) {
 	if cfg.Token == "" {
 		return nil, fmt.Errorf("client token (user API key) is required (yaml token or IP_CLIENT_TOKEN)")
 	}
+	if cfg.DeviceID == "" && cfg.Posture.DeviceID != "" {
+		cfg.DeviceID = cfg.Posture.DeviceID
+	}
 	if cfg.DeviceID == "" {
 		host, _ := os.Hostname()
 		if host == "" {
@@ -62,6 +76,12 @@ func LoadClient(path string) (*ClientConfig, error) {
 	}
 	if cfg.SOCKSListen == "" {
 		cfg.SOCKSListen = "127.0.0.1:1080"
+	}
+	if cfg.DNSListen == "" {
+		cfg.DNSListen = "127.0.0.1:1053"
+	}
+	if cfg.PanelListen == "" {
+		cfg.PanelListen = "127.0.0.1:17890"
 	}
 	switch cfg.Mode {
 	case "", "socks", "tun", "both":

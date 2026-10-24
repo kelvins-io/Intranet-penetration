@@ -26,6 +26,7 @@ const (
 	MsgOpenAck        = "open_ack"
 	MsgPing           = "ping"
 	MsgPong           = "pong"
+	MsgKick           = "kick" // Edge → Client: session terminated by admin
 	MsgError          = "error"
 )
 
@@ -94,7 +95,7 @@ type ClientResource struct {
 	Name       string     `json:"name"`
 	Type       TunnelType `json:"type"`
 	Hostname   string     `json:"hostname,omitempty"`    // e.g. demo.default.tunnel.local
-	VIP        string     `json:"vip,omitempty"`         // reserved for TUN (P1)
+	VIP        string     `json:"vip,omitempty"`         // CGNAT VIP in 100.64.0.0/10
 	Port       int        `json:"port,omitempty"`        // tcp/udp public port hint
 	BrowserURL string     `json:"browser_url,omitempty"` // preferred for http
 	TenantSlug string     `json:"tenant_slug,omitempty"`
@@ -103,6 +104,7 @@ type ClientResource struct {
 
 type ClientHelloAck struct {
 	Version     int              `json:"version"`
+	SessionID   string           `json:"session_id,omitempty"`
 	UserEmail   string           `json:"user_email,omitempty"`
 	TenantID    string           `json:"tenant_id,omitempty"`
 	TenantSlug  string           `json:"tenant_slug,omitempty"`
@@ -111,7 +113,14 @@ type ClientHelloAck struct {
 	SessionTTL  int              `json:"session_ttl_sec,omitempty"`
 	Resources   []ClientResource `json:"resources"`
 	SOCKSHint   string           `json:"socks_hint,omitempty"` // e.g. 127.0.0.1:1080
+	VIPCIDR     string           `json:"vip_cidr,omitempty"`   // e.g. 100.64.0.0/10
 	Message     string           `json:"message,omitempty"`
+}
+
+// KickBody is sent on the control stream to force-disconnect a user client.
+type KickBody struct {
+	SessionID string `json:"session_id,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // DialRequest is the first frame on a client-opened yamux stream.

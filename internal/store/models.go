@@ -134,6 +134,23 @@ type AgentCert struct {
 	NotAfter  time.Time `json:"not_after"`
 	Revoked   bool      `json:"revoked"`
 	CreatedAt time.Time `json:"created_at"`
+	// Kind distinguishes agent vs user-client certificates (empty = agent).
+	Kind string `json:"kind,omitempty"` // agent | client
+}
+
+// BoundDevice ties a user Access Client device_id to a tenant user (device binding).
+type BoundDevice struct {
+	ID        string    `json:"id"`
+	TenantID  string    `json:"tenant_id"`
+	UserID    string    `json:"user_id"`
+	Email     string    `json:"email,omitempty"`
+	DeviceID  string    `json:"device_id"`
+	Hostname  string    `json:"hostname,omitempty"`
+	OS        string    `json:"os,omitempty"`
+	Arch      string    `json:"arch,omitempty"`
+	BoundAt   time.Time `json:"bound_at"`
+	LastSeen  time.Time `json:"last_seen"`
+	Revoked   bool      `json:"revoked"`
 }
 
 // TrafficPolicy limits public traffic to tunnels after AccessPolicy allows.
@@ -165,4 +182,5 @@ type Snapshot struct {
 	TrafficPolicies []TrafficPolicy  `json:"traffic_policies"`
 	PosturePolicies []PosturePolicy  `json:"posture_policies"`
 	AgentPostures   []AgentPosture   `json:"agent_postures"`
+	BoundDevices    []BoundDevice    `json:"bound_devices"`
 }

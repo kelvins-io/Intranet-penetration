@@ -45,6 +45,10 @@ func (s *Server) mountAPI(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/client/bootstrap", s.withAuth(s.handleClientBootstrap))
 	mux.HandleFunc("/api/v1/client/resources", s.withAuth(s.handleClientResources))
 	mux.HandleFunc("/api/v1/client/sessions", s.withAuth(s.handleClientSessions))
+	mux.HandleFunc("/api/v1/client/live-sessions", s.withAuth(s.handleClientLiveSessions))
+	mux.HandleFunc("/api/v1/client/live-sessions/kick", s.withAuth(s.handleClientLiveKick))
+	mux.HandleFunc("/api/v1/client/devices", s.withAuth(s.handleClientDevices))
+	mux.HandleFunc("/api/v1/client/certs", s.withAuth(s.handleClientCerts))
 	// backward compatible
 	mux.HandleFunc("/api/tunnels", s.handleLegacyTunnels)
 }
@@ -818,13 +822,203 @@ func (s *Server) handleClientSessions(w http.ResponseWriter, r *http.Request, au
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	// Short-lived session uses the same API key surface for P0; returns hint metadata.
+	// Short-lived session uses the same API key surface; returns hint metadata.
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"token":            au.User.APIKey,
-		"expires_in_sec":   3600,
-		"user_email":       au.User.Email,
-		"tenant_id":        au.Tenant.ID,
-		"note":             "P0: session token equals user API key; rotate via user settings later",
+		"token":          au.User.APIKey,
+		"expires_in_sec": 3600,
+		"user_email":     au.User.Email,
+		"tenant_id":      au.Tenant.ID,
+		"device_bind":    s.cfg.ClientDeviceBind,
+		"note":           "session token equals user API key; kick via /client/live-sessions",
+	})
+}
+
+func (s *Server) handleClientLiveSessions(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	list := s.clients.List(au.Tenant.ID)
+	if au.User.Role != store.RoleAdmin {
+		filtered := list[:0]
+		for _, ls := range list {
+			if ls.UserID == au.User.ID {
+				filtered = append(filtered, ls)
+			}
+		}
+		list = filtered
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": list})
+}
+
+func (s *Server) handleClientLiveKick(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var body struct {
+		SessionID string `json:"session_id"`
+		UserID    string `json:"user_id"`
+		Reason    string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json")
+		return
+	}
+	if body.Reason == "" {
+		body.Reason = "kicked by admin"
+	}
+	if body.SessionID != "" {
+		ls := s.clients.List(au.Tenant.ID)
+		var found *LiveClientSession
+		for i := range ls {
+			if ls[i].ID == body.SessionID {
+				found = &ls[i]
+				break
+			}
+		}
+		if found == nil {
+			writeErr(w, http.StatusNotFound, "session not found")
+			return
+		}
+		if au.User.Role != store.RoleAdmin && found.UserID != au.User.ID {
+			writeErr(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if err := s.clients.Kick(body.SessionID, body.Reason); err != nil {
+			writeErr(w, http.StatusNotFound, "session not found")
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "client.kick", body.SessionID, body.Reason)
+		writeJSON(w, http.StatusOK, map[string]any{"kicked": 1, "session_id": body.SessionID})
+		return
+	}
+	if au.User.Role != store.RoleAdmin {
+		writeErr(w, http.StatusForbidden, "admin required to kick by user")
+		return
+	}
+	n := s.clients.KickUser(au.Tenant.ID, body.UserID, body.Reason)
+	s.store.Audit(au.Tenant.ID, au.User.Email, "client.kick_user", body.UserID, body.Reason)
+	writeJSON(w, http.StatusOK, map[string]any{"kicked": n})
+}
+
+func (s *Server) handleClientDevices(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	switch r.Method {
+	case http.MethodGet:
+		list := s.store.ListBoundDevices(au.Tenant.ID)
+		if au.User.Role != store.RoleAdmin {
+			filtered := list[:0]
+			for _, d := range list {
+				if d.UserID == au.User.ID {
+					filtered = append(filtered, d)
+				}
+			}
+			list = filtered
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"devices": list, "mode": s.cfg.ClientDeviceBind})
+	case http.MethodPost:
+		if au.User.Role != store.RoleAdmin {
+			writeErr(w, http.StatusForbidden, "admin required")
+			return
+		}
+		var body store.BoundDevice
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad json")
+			return
+		}
+		body.TenantID = au.Tenant.ID
+		if body.UserID == "" {
+			body.UserID = au.User.ID
+			body.Email = au.User.Email
+		}
+		d, err := s.store.EnrollBoundDevice(body)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "client.device.enroll", d.DeviceID, d.ID)
+		writeJSON(w, http.StatusCreated, d)
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "id required")
+			return
+		}
+		if au.User.Role != store.RoleAdmin {
+			owned := false
+			for _, d := range s.store.ListBoundDevices(au.Tenant.ID) {
+				if d.ID == id && d.UserID == au.User.ID {
+					owned = true
+					break
+				}
+			}
+			if !owned {
+				writeErr(w, http.StatusForbidden, "forbidden")
+				return
+			}
+		}
+		if err := s.store.RevokeBoundDevice(id); err != nil {
+			writeErr(w, http.StatusNotFound, "not found")
+			return
+		}
+		s.store.Audit(au.Tenant.ID, au.User.Email, "client.device.revoke", id, "")
+		writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleClientCerts(w http.ResponseWriter, r *http.Request, au *apiUser) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.ca == nil {
+		writeErr(w, http.StatusBadRequest, "CA not configured (enable auto_tls / tls)")
+		return
+	}
+	var body struct {
+		DeviceID string `json:"device_id"`
+		TTLHours int    `json:"ttl_hours"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json")
+		return
+	}
+	if body.DeviceID == "" {
+		body.DeviceID = "client"
+	}
+	ttl := time.Duration(body.TTLHours) * time.Hour
+	if ttl <= 0 {
+		ttl = 24 * 30 * time.Hour
+	}
+	cn := "client:" + body.DeviceID
+	certPEM, keyPEM, serial, notAfter, err := s.ca.IssueAgentCert(cn, au.Tenant.ID, ttl)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.store.RecordAgentCert(store.AgentCert{
+		TenantID: au.Tenant.ID,
+		AgentID:  cn,
+		Serial:   serial,
+		NotAfter: notAfter,
+		Kind:     "client",
+	})
+	caPEM := ""
+	if s.ca != nil {
+		caPEM = string(s.ca.CertPEM)
+	}
+	s.store.Audit(au.Tenant.ID, au.User.Email, "client.cert.issue", cn, serial)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"device_id":  body.DeviceID,
+		"cn":         cn,
+		"serial":     serial,
+		"not_after":  notAfter,
+		"cert_pem":   string(certPEM),
+		"key_pem":    string(keyPEM),
+		"ca_pem":     caPEM,
+		"agent_mtls": s.cfg.AgentMTLS,
 	})
 }
 

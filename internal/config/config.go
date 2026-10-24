@@ -71,7 +71,9 @@ type ServerConfig struct {
 	EdgeID        string        `yaml:"edge_id"`
 	Region        string        `yaml:"region"`
 	EnableE2E         bool          `yaml:"enable_e2e"`
-	AgentMTLS         string        `yaml:"agent_mtls"` // off | optional | require
+	AgentMTLS         string        `yaml:"agent_mtls"` // off | optional | require — also covers Access Client mTLS on the same mux
+	// ClientDeviceBind: off | auto | require — bind user client device_id on hello
+	ClientDeviceBind  string        `yaml:"client_device_bind"`
 	AccessDefaultDeny bool          `yaml:"access_default_deny"`
 	ResumeTTL         time.Duration `yaml:"resume_ttl"`
 	Regions           []RegionPeer  `yaml:"regions"`
@@ -222,6 +224,14 @@ func LoadServer(path string) (*ServerConfig, error) {
 		}
 	default:
 		return nil, fmt.Errorf("agent_mtls must be off|optional|require")
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.ClientDeviceBind)) {
+	case "", "off", "auto", "require":
+		if cfg.ClientDeviceBind == "" {
+			cfg.ClientDeviceBind = "auto"
+		}
+	default:
+		return nil, fmt.Errorf("client_device_bind must be off|auto|require")
 	}
 	if cfg.Cluster.AdvertiseHTTP == "" && role != RoleControl {
 		cfg.Cluster.AdvertiseHTTP = "http://127.0.0.1" + normalizeListen(cfg.HTTPGateway)

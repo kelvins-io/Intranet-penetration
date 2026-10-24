@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/kelvins-io/Intranet-penetration/internal/policy"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
@@ -17,6 +18,8 @@ type clientSessionState struct {
 	tenant    *store.Tenant
 	resources []protocol.ClientResource
 	identity  policy.Identity
+	sessionID string
+	deviceID  string
 }
 
 // serveMuxSession peeks the first control message and routes agent vs user client.
@@ -51,10 +54,31 @@ func (s *Server) serveClientSession(ctx context.Context, sess *tunnel.Session, e
 		if err := s.enforceClientPosture(ten.ID, h); err != nil {
 			return nil, err
 		}
+		deviceID := strings.TrimSpace(h.DeviceID)
+		if deviceID == "" {
+			deviceID = strings.TrimSpace(h.Posture.DeviceID)
+		}
+		if deviceID == "" {
+			deviceID = "unknown"
+		}
+		if s.store != nil {
+			host := h.Posture.Hostname
+			if _, err := s.store.BindOrTouchDevice(
+				s.cfg.ClientDeviceBind, ten.ID, user.ID, user.Email, deviceID,
+				host, h.Posture.OS, h.Posture.Arch,
+			); err != nil {
+				return nil, err
+			}
+		}
 		resources := s.projectClientResources(ten, id)
-		st = &clientSessionState{user: user, tenant: ten, resources: resources, identity: id}
+		sid := store.NewID("csess")
+		st = &clientSessionState{
+			user: user, tenant: ten, resources: resources, identity: id,
+			sessionID: sid, deviceID: deviceID,
+		}
 		return &protocol.ClientHelloAck{
 			Version:    protocol.Version,
+			SessionID:  sid,
 			UserEmail:  user.Email,
 			TenantID:   ten.ID,
 			TenantSlug: ten.Slug,
@@ -63,14 +87,32 @@ func (s *Server) serveClientSession(ctx context.Context, sess *tunnel.Session, e
 			SessionTTL: 3600,
 			Resources:  resources,
 			SOCKSHint:  "127.0.0.1:1080",
+			VIPCIDR:    "100.64.0.0/10",
 		}, nil
 	})
 	if err != nil {
 		s.log.Warn("client handshake failed", "remote", remote, "err", err)
 		return
 	}
-	s.log.Info("client session ready", "user", ack.UserEmail, "tenant", ack.TenantSlug, "resources", len(ack.Resources), "remote", remote)
-	s.auditEvent(st.tenant.ID, st.user.Email, "client.session", remote, fmt.Sprintf("resources=%d", len(st.resources)))
+	live := &LiveClientSession{
+		ID:        st.sessionID,
+		TenantID:  st.tenant.ID,
+		UserID:    st.user.ID,
+		Email:     st.user.Email,
+		DeviceID:  st.deviceID,
+		Remote:    remote,
+		EdgeID:    s.cfg.EdgeID,
+		Region:    s.cfg.Region,
+		Connected: time.Now().UTC(),
+		sess:      sess,
+	}
+	s.clients.Register(live)
+	defer s.clients.Unregister(st.sessionID)
+
+	s.log.Info("client session ready", "session", st.sessionID, "user", ack.UserEmail,
+		"tenant", ack.TenantSlug, "device", st.deviceID, "resources", len(ack.Resources), "remote", remote)
+	s.auditEvent(st.tenant.ID, st.user.Email, "client.session", remote,
+		fmt.Sprintf("session=%s device=%s resources=%d", st.sessionID, st.deviceID, len(st.resources)))
 
 	for {
 		stream, err := sess.AcceptStream()
@@ -190,5 +232,6 @@ func (s *Server) enforceClientPosture(tenantID string, h protocol.ClientHello) e
 	if device == "" {
 		device = "client"
 	}
-	return s.enforcePosture(tenantID, device, posture)
+	// Tag client devices in posture store as client:<device>
+	return s.enforcePosture(tenantID, "client:"+device, posture)
 }

@@ -63,6 +63,8 @@ type Server struct {
 		at      time.Time
 	}
 
+	clients *clientLiveRegistry
+
 	mu        sync.Mutex
 	tcpStops  map[string]context.CancelFunc
 	listeners []net.Listener
@@ -78,6 +80,7 @@ func New(cfg *config.ServerConfig, log *slog.Logger) (*Server, error) {
 	s := &Server{
 		cfg:      cfg,
 		registry: NewRegistry(),
+		clients:  newClientLiveRegistry(),
 		resume:   resume.New(cfg.ResumeTTL), // replaced with Redis when configured
 		metrics:  metrics.New(),
 		limiter:  traffic.NewLimiter(),

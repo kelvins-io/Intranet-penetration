@@ -1,24 +1,41 @@
 package client
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
-// TunEngine is the P1 virtual NIC interface. P0 returns unsupported.
+// TunEngine is the virtual NIC interface (P1).
 type TunEngine interface {
 	Start(ctx context.Context) error
 	Stop() error
 }
 
-// NewTunEngine returns a platform TUN engine when mode includes tun.
-func NewTunEngine(c *Client) TunEngine {
-	return &stubTun{c: c}
+type baseTun struct {
+	c      *Client
+	dns    *DNSEngine
+	mu     sync.Mutex
+	cancel context.CancelFunc
 }
 
-type stubTun struct{ c *Client }
-
-func (t *stubTun) Start(ctx context.Context) error {
-	t.c.log.Warn("TUN mode not implemented in P0; use socks (system proxy). Planned for P1 with VIP/DNS.")
-	<-ctx.Done()
-	return ctx.Err()
+func (t *baseTun) Stop() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.cancel != nil {
+		t.cancel()
+		t.cancel = nil
+	}
+	if t.dns != nil {
+		return t.dns.Cleanup()
+	}
+	return nil
 }
 
-func (t *stubTun) Stop() error { return nil }
+func (c *Client) waitReady(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.Ready():
+		return nil
+	}
+}

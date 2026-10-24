@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kelvins-io/Intranet-penetration/internal/config"
 	"github.com/kelvins-io/Intranet-penetration/internal/protocol"
+	"github.com/kelvins-io/Intranet-penetration/internal/tlsutil"
 	"github.com/kelvins-io/Intranet-penetration/internal/tunnel"
 )
 
@@ -24,13 +25,48 @@ type Client struct {
 	sess      *tunnel.Session
 	resources []protocol.ClientResource
 	ack       *protocol.ClientHelloAck
+	ready     chan struct{}
+	readyOnce sync.Once
+	kicked    atomic.Bool
 }
 
 func New(cfg *config.ClientConfig, log *slog.Logger) *Client {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Client{cfg: cfg, log: log}
+	return &Client{cfg: cfg, log: log, ready: make(chan struct{})}
+}
+
+// Ready is closed after the first successful client_hello (resources available).
+func (c *Client) Ready() <-chan struct{} { return c.ready }
+
+func (c *Client) SessionReady() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sess != nil && !c.sess.IsClosed()
+}
+
+func (c *Client) LookupByVIP(vip string) (protocol.ClientResource, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, r := range c.resources {
+		if r.VIP == vip {
+			return r, true
+		}
+	}
+	return protocol.ClientResource{}, false
+}
+
+func (c *Client) Ack() *protocol.ClientHelloAck {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ack
+}
+
+func (c *Client) Kicked() bool { return c.kicked.Load() }
+
+func (c *Client) signalReady() {
+	c.readyOnce.Do(func() { close(c.ready) })
 }
 
 func (c *Client) Resources() []protocol.ClientResource {
@@ -50,6 +86,19 @@ func (c *Client) Run(ctx context.Context) error {
 		err := c.connectOnce(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if c.kicked.Load() {
+			if c.cfg.ExitOnKick {
+				return fmt.Errorf("session kicked: %w", err)
+			}
+			c.log.Warn("session kicked; waiting before reconnect", "err", err, "after", backoff*5)
+			c.kicked.Store(false)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff * 5):
+			}
+			continue
 		}
 		c.log.Warn("client disconnected", "err", err, "after", backoff)
 		c.mu.Lock()
@@ -71,18 +120,14 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	}
 	defer sess.Close()
 
+	posture := c.buildPosture()
 	ack, err := sess.HandshakeAsUserClient(protocol.ClientHello{
 		Version:   protocol.Version,
 		Token:     c.cfg.Token,
 		DeviceID:  c.cfg.DeviceID,
 		Region:    c.cfg.Region,
-		ClientVer: "0.5.0",
-		Posture: protocol.DevicePosture{
-			OS:           runtime.GOOS,
-			Arch:         runtime.GOARCH,
-			DeviceID:     c.cfg.DeviceID,
-			AgentVersion: "0.5.0",
-		},
+		ClientVer: posture.AgentVersion,
+		Posture:   posture,
 	})
 	if err != nil {
 		return err
@@ -92,23 +137,69 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	c.ack = ack
 	c.resources = append([]protocol.ClientResource(nil), ack.Resources...)
 	c.mu.Unlock()
+	c.signalReady()
 	c.log.Info("client session ready", "transport", transport, "user", ack.UserEmail,
-		"tenant", ack.TenantSlug, "resources", len(ack.Resources), "edge", ack.EdgeID)
+		"tenant", ack.TenantSlug, "session", ack.SessionID, "resources", len(ack.Resources), "edge", ack.EdgeID)
+	for _, r := range ack.Resources {
+		c.log.Info("resource", "id", r.ID, "host", r.Hostname, "vip", r.VIP, "type", r.Type, "browser", r.BrowserURL)
+	}
+
+	ctrlErr := make(chan error, 1)
+	go func() { ctrlErr <- c.watchControl(sess) }()
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-sess.CloseChan():
 		return fmt.Errorf("session closed")
+	case err := <-ctrlErr:
+		return err
 	}
+}
+
+func (c *Client) watchControl(sess *tunnel.Session) error {
+	for {
+		env, err := sess.ReadControlEnvelope()
+		if err != nil {
+			return fmt.Errorf("control closed: %w", err)
+		}
+		switch env.Type {
+		case protocol.MsgKick:
+			var body protocol.KickBody
+			_ = protocol.DecodeBody(env, &body)
+			c.kicked.Store(true)
+			c.log.Warn("kicked by edge", "session", body.SessionID, "reason", body.Reason)
+			_ = sess.Close()
+			return fmt.Errorf("kicked: %s", body.Reason)
+		case protocol.MsgPing:
+			_ = protocol.WriteJSON(sess.Control(), protocol.MsgPong, map[string]string{"ok": "1"})
+		case protocol.MsgError:
+			var body protocol.ErrorBody
+			_ = protocol.DecodeBody(env, &body)
+			c.log.Warn("control error", "code", body.Code, "msg", body.Message)
+		default:
+			c.log.Debug("control message", "type", env.Type)
+		}
+	}
+}
+
+func (c *Client) clientTLS() (*tls.Config, error) {
+	m := c.cfg.MTLS
+	if !m.Enabled && m.CertFile == "" {
+		return &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"ip-tunnel"}}, nil
+	}
+	return tlsutil.ClientMTLSConfig(m.CAFile, m.CertFile, m.KeyFile, m.InsecureSkipVerify || m.CAFile == "")
 }
 
 func (c *Client) dial(ctx context.Context) (*tunnel.Session, string, error) {
 	var errs []string
+	tlsConf, err := c.clientTLS()
+	if err != nil {
+		return nil, "", err
+	}
 	if c.cfg.PreferQUIC {
 		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		qTLS := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"ip-tunnel"}}
-		sess, err := tunnel.ClientQUICSession(qctx, c.cfg.QUICAddr, qTLS)
+		sess, err := tunnel.ClientQUICSession(qctx, c.cfg.QUICAddr, tlsConf.Clone())
 		cancel()
 		if err == nil {
 			return sess, "quic", nil
@@ -118,15 +209,28 @@ func (c *Client) dial(ctx context.Context) (*tunnel.Session, string, error) {
 	}
 	d := net.Dialer{Timeout: 10 * time.Second}
 	raw, err := d.DialContext(ctx, "tcp", c.cfg.ServerAddr)
-	if err == nil {
-		sess, err := tunnel.ClientSession(raw)
-		if err == nil {
-			return sess, "tcp", nil
-		}
-		_ = raw.Close()
-		errs = append(errs, "yamux: "+err.Error())
-	} else {
+	if err != nil {
 		errs = append(errs, "tcp: "+err.Error())
+	} else {
+		conn := raw
+		if c.cfg.MTLS.Enabled || c.cfg.MTLS.CertFile != "" {
+			tlsConn := tls.Client(raw, tlsConf.Clone())
+			if herr := tlsConn.HandshakeContext(ctx); herr != nil {
+				_ = raw.Close()
+				errs = append(errs, "tls: "+herr.Error())
+				conn = nil
+			} else {
+				conn = tlsConn
+			}
+		}
+		if conn != nil {
+			sess, err := tunnel.ClientSession(conn)
+			if err == nil {
+				return sess, "tcp", nil
+			}
+			_ = conn.Close()
+			errs = append(errs, "yamux: "+err.Error())
+		}
 	}
 	if c.cfg.WSAddr != "" && c.cfg.PreferWS {
 		sess, err := tunnel.ClientWSSession(ctx, c.cfg.WSAddr, nil)

@@ -45,6 +45,7 @@ func (s *Server) projectClientResources(tenant *store.Tenant, id policy.Identity
 			Name:       name,
 			Type:       typ,
 			Hostname:   host,
+			VIP:        assignResourceVIP(key),
 			Port:       port,
 			TenantSlug: slug,
 			TenantID:   tenantID,

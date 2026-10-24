@@ -45,7 +45,7 @@ func main() {
 		}
 	}
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	go func() { errCh <- cl.Run(ctx) }()
 
 	if cfg.Mode == "socks" || cfg.Mode == "both" {
@@ -56,6 +56,10 @@ func main() {
 		go func() {
 			errCh <- tun.Start(ctx)
 		}()
+	}
+	if cfg.PanelListen != "" && cfg.PanelListen != "-" {
+		panel := client.NewPanel(cl, cfg.PanelListen, sysProxy)
+		go func() { errCh <- panel.Start(ctx) }()
 	}
 
 	select {
